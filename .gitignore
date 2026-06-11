@@ -19,5 +19,5 @@ results/replica_room0/exploratory/
 run_overnight.sh
 run_watchdog.sh
 docs/paper/*
-!docs/paper/report.tex
-!docs/paper/report.pdf
+!docs/paper/Improving_MonoGS_Report.tex
+!docs/paper/Improving_MonoGS_Report.pdf
