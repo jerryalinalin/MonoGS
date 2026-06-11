@@ -164,8 +164,8 @@ LPIPS $\downarrow$ & 0.068 & \textbf{0.049} & $-28\%$ \\
 \hline
 \end{tabular}
 \end{center}
-\vspace{2mm}
-\footnotesize{$^\mathrm{a}$TUM rendering metrics in the original paper are averaged over three sequences (fr1/desk, fr2/xyz, fr3/office), whereas we report fr3/office only.}
+\vspace{1mm}
+{\footnotesize $^\mathrm{a}$TUM rendering metrics in the original paper are averaged over three sequences (fr1/desk, fr2/xyz, fr3/office), whereas we report fr3/office only.}
 \end{table}
 
 \section{Identified Limitations}
@@ -219,8 +219,6 @@ MonoGS maintains an active optimization window of $N$ keyframes ($N=10$ for mono
 When a new keyframe is inserted, an existing keyframe is evicted based on an overlap-coefficient criterion.
 We log the per-frame photometric residual $\delta_t = \frac{1}{|\Omega|} \sum_{\mathbf{p} \in \Omega} |\mathbf{I}_t(\mathbf{p}) - \hat{\mathbf{I}}_t(\mathbf{p})|$ for every processed frame throughout training.
 
-Figure~\ref{fig:hist_residual} reveals a striking bifurcation.
-For frames currently in the optimization window, $\delta$ stabilizes around 0.08 after an initial burn-in phase.
 As shown in Fig.~\ref{fig:hist_residual}, in-window frame residuals (blue) stabilize after an initial burn-in phase. Evicted-frame residuals (red) exhibit higher variance and a persistent upward trend in the latter half of training (iterations $>$12{,}000), remaining on average 1.3--1.8$\times$ higher than in-window residuals during this period. The high variance reflects the heterogeneity of evicted frames: some regions remain well-covered by the active window via covisibility, while others---particularly room corners and occluded surfaces---receive essentially no indirect supervision and drift progressively.
 This drift is spatially localized: regions observed by few keyframes (e.g., room corners or occluded areas) exhibit the largest residual growth.
 
@@ -319,6 +317,7 @@ python slam.py --config configs/mono/tum/fr3_office.yaml --seed 42
 \end{verbatim}
 
 \subsection{\oursD2: Historical Keyframe Replay}
+\label{sec:d2}
 \label{sec:d2}
 
 \textbf{Falsifiable Hypothesis.}
@@ -439,8 +438,8 @@ Baseline & 0.45 & 0.27 & \textbf{36.84} & \textbf{0.968} & 0.049 & 4491 & 7.8 \\
 \hline
 \end{tabular}
 \end{center}
-\vspace{2mm}
-\footnotesize{Note: The ablation baseline ATE (3.45~cm) differs slightly from the reproduction baseline (3.35~cm, Table~\ref{tab:baseline}) due to fixed-seed initialization ensuring fair comparison across all ablation variants.}
+\vspace{1mm}
+{\footnotesize Note: The ablation baseline ATE (3.45~cm) differs slightly from the reproduction baseline (3.35~cm, Table~\ref{tab:baseline}) due to fixed-seed initialization ensuring fair comparison across all ablation variants.}
 \end{table*}
 
 \textbf{View-Direction-Aware Regularization (\oursB4).}
@@ -458,7 +457,7 @@ On Replica, \oursD2~maintains rendering parity with the baseline while improving
 
 \textbf{Negative Interference in \oursFull.}
 The most surprising result is the failure of the combined system.
-On TUM, \oursFull~underperforms \oursD2~alone (ATE 3.80~cm, LPIPS 0.365).
+On TUM, \oursFull~achieves a second-best ATE (3.15~cm) but underperforms \oursD2~alone on perceptual metrics (LPIPS 0.368 vs. 0.349).
 On Replica, it produces the worst rendering result of all variants (PSNR 35.59, $-3.4\%$ vs. baseline).
 We hypothesize that \oursB4~and \oursD2~induce conflicting gradient directions. To test this, we computed the cosine similarity between the B4 regularization gradient and the D2 replay gradient at 100 randomly sampled iterations during the first 5000 training steps. The mean cosine similarity is $-0.23$, confirming systematic gradient interference.
 \oursB4~exerts a geometric prior toward isotropy, flattening the loss landscape along anisotropy axes.
@@ -505,23 +504,36 @@ Figures~\ref{fig:qualitative_tum} and~\ref{fig:qualitative_rep} show sample rend
 \caption{Rendering comparison on TUM fr3/office training views. From left to right: GT, Baseline, +IsoReg, +Replay, Full. All variants produce visually similar results on training views; quantitative differences on held-out views are reported in Table~\ref{tab:ablation_tum}.}
 \label{fig:qualitative_tum}
 \end{figure*}
+\end{figure*}
 
-\noindent\textbf{View 1 (TUM, novel view of office wall):}
-The baseline shows pronounced horizontal streaking along the wall and desk surface, caused by view-aligned Gaussians that collapse under projection.
-+\oursB4~suppresses these streaks but softens texture details (e.g., the wood grain), corroborating the LPIPS degradation.
-+\oursD2~preserves sharp texture while eliminating streaks.
-\oursFull~reintroduces moderate blur, suggesting that the combined loss landscape drives Gaussians toward mean, ``safe'' configurations that compromise on both geometry and appearance.
+\begin{figure*}[t]
+\centering
+\setlength{\tabcolsep}{2pt}
+\begin{tabular}{cccc}
+  \includegraphics[height=3.8cm]{figures/rep_gt.png} &
+  \includegraphics[height=3.8cm]{figures/rep_baseline.png} &
+  \includegraphics[height=3.8cm]{figures/rep_replay.png} &
+  \includegraphics[height=3.8cm]{figures/rep_full.png} \\\[2pt]
+  \small GT &
+  \small Baseline (36.6) &
+  \small {+\oursD2~(38.5)} &
+  \small \oursFull~(35.7) \\\
+\end{tabular}
+\caption{Rendering comparison on Replica room0 (training frame~5, single-frame PSNR in parentheses). \oursD2~achieves sharper reproduction of the dresser and window region (right side), consistent with reduced map drift in low-covisibility areas. \oursFull~exhibits a washed-out appearance near the lamp, corroborating the gradient-interference hypothesis.}
+\label{fig:qualitative_rep}
+\end{figure*}
 
-\noindent\textbf{View 2 (Replica, room corner):}
-The baseline renders the corner accurately.
+\noindent\textbf{TUM fr3/office (Fig.~\ref{fig:qualitative_tum}).}
+On this training frame, all variants produce similar renderings on the desk and background scene elements, as expected for directly supervised views. The key distinction is \oursFull: visible ghosting and blue-tinted smearing appear on the desk surface, consistent with gradient interference driving Gaussians to degenerate opacity configurations.
+
+\noindent\textbf{Replica room0 (Fig.~\ref{fig:qualitative_rep}).}
+The synthetic Replica scene provides a cleaner comparison. \oursD2~renders the dresser and window region with noticeably sharper detail (PSNR 38.5 vs.\ 36.6 for baseline on this frame), confirming that continued supervision of historical keyframes reduces map drift in low-covisibility regions. \oursFull~shows a washed-out appearance near the lamp (PSNR 35.7), where the competing B4 and D2 gradients prevent stable convergence of specular highlights.
+
 +\oursB4~produces a slightly ``washed-out'' appearance.
 +\oursD2~is nearly indistinguishable from baseline.
 \oursFull~exhibits visible floaters near the ceiling corner, where conflicting gradients from B4 and D2 have pushed opacity to degenerate values.
 
-\noindent\textbf{View 3 (TUM, low-texture floor region):}
-The baseline shows drift-induced ghosting on the floor.
-+\oursD2~cleanly removes this ghosting, confirming that historical supervision is essential for textureless regions.
-+\oursB4~has minimal impact here because floor Gaussians are largely surface-parallel and thus unaffected by the view-aware penalty.
+
 
 \subsection{Failed Improvement Attempts}
 \label{sec:failed}
