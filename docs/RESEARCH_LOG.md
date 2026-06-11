@@ -13,11 +13,11 @@
 | Phase 1：基线复现 | ✅ | TUM ATE 3.35cm（论文3.50），Replica ATE 0.44cm（论文0.44），均在容忍范围内 |
 | Phase 2：缺陷可视化 | ✅ | 窗口残差差距4.6×；高斯拉伸比155×；密度化梯度与残差正相关r=0.348 |
 | Phase 3：改进A（自适应KF） | ❌ | 4方案全部失败。根本矛盾：OC几何约束不可替代，残差信息无法补充几何关系 |
-| Phase 4：改进B（IsoReg） | ✅ | B4视线感知正则化最优：TUM ATE 3.01cm，Replica ATE 0.35cm |
+| Phase 4：改进B（IsoReg） | ❌ | B4视线感知正则化未改善ATE（TUM 3.50cm），LPIPS退化（0.342→0.369）。假设不成立。 |
 | Phase 5：改进C（自适应密度化） | ❌ | 2方案全部失败。根本矛盾：高残差=高梯度，补充密度化无操作空间 |
-| Phase 6：改进D（关键帧重放） | ✅ | D2（10%重放频率）全指标改善：TUM ATE 3.06cm，PSNR +0.58dB，LPIPS -7.1% |
-| Phase 7：消融实验 | ✅ | 8次实验完成，数据见 `results/metrics.csv` |
-| Phase 8：GitHub + 报告 | 🔲 | — |
+| Phase 6：改进D（关键帧重放） | ✅ | D2（10%重放频率）ATE 3.28cm，RPE 0.69cm，LPIPS 0.349；Replica ATE 0.41cm |
+| Phase 7：消融实验 | ✅ | 8次实验完成，数据见 `results/ablation_metrics.csv` |
+| Phase 8：GitHub + 报告 | ✅ | 报告已提交；GitHub含代码、结果、PDF |
 
 ---
 
