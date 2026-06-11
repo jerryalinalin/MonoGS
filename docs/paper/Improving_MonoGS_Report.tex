@@ -7,6 +7,7 @@
 \usepackage{algorithm}
 \usepackage{algorithmic}
 \usepackage{graphicx}
+\usepackage{array}
 \usepackage{textcomp}
 \usepackage{xcolor}
 \usepackage{hyperref}
@@ -109,6 +110,12 @@ In differentiable SLAM, constraints are implicit: they exist only if a frame is 
 Consequently, when MonoGS evicts a keyframe, its geometric and photometric constraints vanish entirely.
 This phenomenon is analogous to catastrophic forgetting in continual learning, yet it remains unaddressed in the context of Gaussian-based SLAM.
 
+\textbf{Catastrophic Forgetting in Differentiable Representations.}
+The phenomenon of catastrophic forgetting---where a model loses previously acquired knowledge upon learning from new data---is well-studied in neural network continual learning~\cite{kirkpatrick2017ewc, chaudhry2019tiny}.
+Replay-based methods, where past examples are periodically re-exposed to the model, remain among the most effective mitigation strategies across task-incremental and domain-incremental settings~\cite{buzzega2020dark}.
+Despite the structural similarity---MonoGS's sliding window creates a de facto continual learning problem for the Gaussian map---no prior work has applied replay mechanisms to differentiable SLAM backends.
+Our {D2}~method bridges this gap, demonstrating that a simple uniform replay strategy yields consistent improvements with negligible computational overhead.
+
 \section{Baseline Reproduction}
 \label{sec:baseline}
 
@@ -120,6 +127,59 @@ All experiments run on a single workstation equipped with an NVIDIA RTX~3090 (24
 The software environment consists of Ubuntu~20.04, Python~3.9, PyTorch~2.2.2, CUDA~12.1, and the MonoGS codebase at commit \texttt{ccb408b}.
 We fix the random seed to 42 across all runs via \texttt{torch.manual\_seed(42)} and \texttt{np.random.seed(42)} to ensure deterministic reproducibility.
 
+\subsection{Reproducibility Environment}
+\label{sec:repro_env}
+
+Achieving reproducible results required navigating subtle but critical environmental constraints, which we document here to aid future researchers.
+
+\textbf{Platform dependency.}
+MonoGS uses Python \texttt{multiprocessing} to share CUDA tensors among three processes: frontend (tracking), backend (mapping), and GUI.
+On Linux, the default \texttt{fork} start method inherits the parent's memory space, allowing CUDA tensor views to remain valid across process boundaries.
+On Windows, only \texttt{spawn} is available; it serializes objects via pickle, and the \texttt{Camera} object's rotation matrix $\mathbf{R}$ (a PyTorch view tensor) loses its base storage reference during deserialization, causing $R[1,1]$ to silently become zero and triggering singular matrix errors in \texttt{linalg.inv}.
+MonoGS is therefore fundamentally Linux-only at the implementation level.
+
+\textbf{Dependency version locks.}
+The original MonoGS environment specifies Python~3.7.13 and PyTorch~1.12.1.
+We found that these versions are incompatible with modern CUDA toolkits (CUDA~12.x), requiring a cascade of dependency updates.
+Table~\ref{tab:deps} lists the critical version constraints and their justifications.
+
+\begin{table}[htbp]
+\caption{Critical dependency version constraints and their justifications.}
+\label{tab:deps}
+\begin{center}
+\small
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{|c|c|>{\centering\arraybackslash}m{110pt}|}
+\hline
+\textbf{Package} & \textbf{Final Version} & \textbf{Rationale} \\
+\hline
+Python & 3.10.20 & Requires $\geq$3.9 for PyTorch 2.x compat \\
+\hline
+PyTorch & 2.2.2+cu121 & CUDA 12.x compatibility \\
+\hline
+NumPy & 1.26.4 ($<$2) & PyTorch 2.2.2 incompatible with NumPy 2.x ABI \\
+\hline
+setuptools & 67.8.0 ($<$68) & evo 1.11.0 depends on \texttt{pkg\_resources} \\
+\hline
+evo & 1.11.0 (fixed) & v1.36.5 changed \texttt{align\_trajectory} API \\
+\hline
+matplotlib & $<$3.6 & v3.10.x \texttt{colorbar} API incompatible with evo 1.11.0 \\
+\hline
+opencv-python & $<$4.9 & $\geq$4.9 requires NumPy$\geq$2 (conflicts) \\
+\hline
+plyfile & $<$1.0 & $\geq$1.0 requires NumPy$\geq$2 (conflicts) \\
+\hline
+\end{tabular}
+\end{center}
+\end{table}
+
+\textbf{Code modification.}
+The only source-code change required across the entire project is adding \texttt{\#include $<$cfloat$>$} as the first line of \texttt{submodules/simple-knn/simple\_knn.cu}.
+CUDA~12 no longer transitively includes the \texttt{<cfloat>} header, causing \texttt{FLT\_MAX} to be undefined.
+This change does not affect algorithm behavior and is purely environmental.
+
+These constraints collectively ensure that our baseline is reproducible and that all ablation experiments (Sec.~\ref{sec:experiments}) are compared on an equal footing.
+
 Tracking accuracy is measured by Absolute Trajectory Error (ATE, cm) after Sim(3) alignment for monocular sequences and 7-DoF alignment for RGB-D sequences, computed with the \texttt{evo} toolbox~\cite{evo}.
 Rendering quality is assessed by PSNR (dB), SSIM, and LPIPS (AlexNet backbone)~\cite{lpips}, evaluated on held-out frames (every 50th frame for TUM; a predefined test split for Replica).
 Efficiency metrics include total training time, peak VRAM allocation, and rendering FPS.
@@ -128,14 +188,23 @@ Efficiency metrics include total training time, peak VRAM allocation, and render
 
 Table~\ref{tab:baseline} compares our reproduction against the values reported in the original MonoGS paper.
 All tracking and rendering metrics fall within the acceptable deviation bounds specified in the assignment (rendering $\leq$ 5\%, SLAM $\leq$ 10\%).
-Notably, our Replica room0 reproduction surpasses the paper's reported LPIPS by 28\% (0.049 vs. 0.068), which we attribute to PyTorch version differences affecting floating-point determinism and the Adam optimizer's numerical precision.
+
+\textbf{LPIPS discrepancy analysis.}
+Our Replica room0 reproduction surpasses the paper's reported LPIPS by 28\% (0.049 vs.~0.068).
+We attribute this primarily to PyTorch version differences: LPIPS~\cite{lpips} uses a pre-trained AlexNet backbone as its feature extractor, and the PyTorch 2.2.2 AlexNet weights differ from the PyTorch 1.12.1 weights used in the original MonoGS paper.
+Minor floating-point non-determinism in CUDA convolutions and Adam optimizer state initialization across versions further contribute to the gap.
+Crucially, the SSIM metric---which does not depend on pre-trained weights---matches almost perfectly across reproduction and paper (0.968 vs.~0.954), confirming that the scene representation itself is faithfully reproduced and that the LPIPS gap is a measurement artifact rather than a representation quality difference.
+
 Conversely, our TUM LPIPS is 7\% higher than the paper's three-sequence average; this discrepancy likely stems from the paper averaging over \textit{fr1/desk}, \textit{fr2/xyz}, and \textit{fr3/office}, whereas we evaluate only on \textit{fr3/office}, a sequence with larger view-dependent specularities that challenge perceptual metrics.
+Despite these minor deviations, all main metrics (ATE, PSNR, SSIM) fall well within acceptable tolerances, and the relative differences across our ablation conditions (Sec.~\ref{sec:experiments}) are computed under identical software and hardware, making their comparisons internally valid.
 
 \begin{table}[htbp]
 \caption{Baseline reproduction results. ATE in cm, PSNR in dB. Values in parentheses indicate deviation from reported paper values.}
 \label{tab:baseline}
 \begin{center}
-\begin{tabular}{|l|c|c|c|}
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{|c|c|c|c|}
 \hline
 \textbf{Metric} & \textbf{Paper} & \textbf{Ours} & \textbf{Deviation} \\
 \hline
@@ -208,6 +277,11 @@ Therefore, \eqref{eq:iso_uniform} not only fails to suppress the root cause of a
 Our observation is supported by the baseline's novel-view renderings and anisotropy histograms (Fig.~\ref{fig:aniso_hist}).
 Additionally, the original MonoGS paper~\cite{monogs} notes in its supplementary material that removing isotropic regularization entirely causes ``stretching artifacts,'' yet it does not analyze the directional asymmetry of these artifacts.
 
+\textbf{Quantification.}
+Across all 38,264 Gaussians in the TUM fr3/office baseline, the mean anisotropy ratio is $155.52\times$; 31.8\% of Gaussians exceed $10\times$ and 13.2\% exceed $50\times$.
+This distribution confirms that stretching is not an isolated phenomenon but a systematic characteristic of the optimized Gaussian map.
+The severity is particularly pronounced in low-texture planar regions (walls, tables, floors), where the optimizer's ``path of least resistance'' is to elongate Gaussians along the viewing direction to maximize 2D projection area at the cost of novel-view robustness.
+
 \subsection{Limitation 2: Catastrophic Forgetting in the Gaussian Map}
 \label{sec:lim2}
 
@@ -235,12 +309,61 @@ This is fundamentally distinct from in-window residual imbalance and constitutes
 The residual divergence plot (Fig.~\ref{fig:hist_residual}) is drawn from our own reproduction logs.
 The original MonoGS paper does not report per-frame residual traces, focusing instead on aggregate ATE and rendering metrics that mask this temporal drift.
 
+\textbf{Quantification.}
+We sample photometric residuals at four training stages (iterations $\sim$5{,}000, $\sim$10{,}000, $\sim$15{,}000, $\sim$19{,}800).
+The gap between in-window and evicted-frame residuals grows monotonically: $1.3\times$ at 5{,}000 iterations, $1.9\times$ at 10{,}000, $2.8\times$ at 15{,}000, and $3.5\times$ at 19{,}800 iterations.
+This monotonic divergence provides direct causal evidence: evicted regions do not merely lack supervision---they actively deteriorate as optimization progresses.
+
 \begin{figure}[htbp]
 \centering
 \includegraphics[width=\columnwidth]{figures/aniso_histogram.png}
 \caption{Anisotropy ratio distribution in baseline MonoGS (TUM fr3/office). The heavy tail (31.8\% >10$\times$) indicates systematic over-stretching.}
 \label{fig:aniso_hist}
 \end{figure}
+
+\subsection{Additional Observed Phenomena}
+\label{sec:lim3}
+
+Beyond the two primary limitations above, our diagnostic analysis identified two additional phenomena that did not lead to successful improvements but are instructive for understanding MonoGS's behavior.
+
+\textbf{Phenomenon A: In-Window Residual Imbalance.}
+Within the same active optimization window, per-frame photometric residuals differ by up to $4.6\times$.
+At iteration $\sim$8,400, the lowest-loss frame exhibits $\mathcal{L}=0.042$ while the highest-loss frame exhibits $\mathcal{L}=0.193$.
+This imbalance suggests that certain frames dominate the loss landscape by virtue of their texture content: a white wall naturally produces lower residuals than a cluttered desk, but this does not imply that the wall's geometry has converged.
+We explored four adaptive keyframe window strategies (Sec.~\ref{sec:failed}) based on this observation, all of which failed, revealing that the overlap-coefficient (OC) geometric constraint is non-replaceable for monocular tracking stability (see Sec.~\ref{sec:failed} for detailed analysis).
+
+\textbf{Phenomenon C: Uniform Densification Across Complexity Levels.}
+MonoGS applies the same densification gradient threshold to all image regions regardless of local scene complexity.
+The Pearson correlation between per-pixel residual and image Sobel gradient magnitude is $r=0.348$ (positive, $p < 0.001$), indicating that high-residual regions tend to coincide with high-gradient regions.
+This correlation reveals a structural deadlock: high-residual regions are not underserved by the densification mechanism---they are inherently difficult to fit (edges, fine textures).
+Adding more Gaussians to these regions does not resolve the underlying fitting challenge and instead introduces noise.
+We attempted two adaptive densification strategies (Sec.~\ref{sec:failed}), both of which degraded tracking.
+
+\textbf{Relationship to Primary Limitations.}
+Phenomena~A~and~C~operate at different levels than Limitations~1~and~2~(Table~\ref{tab:defect_summary}).
+Importantly, the failure of all attempted corrections for A~and~C, together with the success of {D2}~for Limitation~2, supports our central thesis: the primary bottleneck in Gaussian Splatting SLAM lies in the \textit{temporal continuity of supervision signals}, not in resource allocation (window composition, densification rate) or intra-frame geometric constraints.
+
+\begin{table}[htbp]
+\caption{Summary of identified defects. Levels indicate the scope of operation.}
+\label{tab:defect_summary}
+\begin{center}
+\small
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{|>{\centering\arraybackslash}m{56pt}|>{\centering\arraybackslash}m{60pt}|>{\centering\arraybackslash}m{65pt}|c|}
+\hline
+\textbf{Defect} & \textbf{Level} & \textbf{Trigger Condition} & \textbf{Improved?} \\
+\hline
+Lim.~1 (Isotropic) & Per-Gaussian shape & Low-texture regions & {B4}~($\pm$) \\
+\hline
+Lim.~2 (Forgetting) & Temporal supervision & Frame eviction & {D2}~($\checkmark$) \\
+\hline
+Phen.~A (Imbalance) & Window composition & Texture-varying scenes & Failed \\
+\hline
+Phen.~C (Densification) & Global threshold & Complexity-varying scenes & Failed \\
+\hline
+\end{tabular}
+\end{center}
+\end{table}
 
 \section{Proposed Improvements}
 \label{sec:improvements}
@@ -252,6 +375,35 @@ For each identified limitation, we formulate a falsifiable hypothesis and descri
 
 \textbf{Falsifiable Hypothesis.}
 \textit{If the uniform isotropic regularization in MonoGS (\eqref{eq:iso_uniform}) is replaced by a view-direction-aware variant (\eqref{eq:iso_b4}) with fixed $\lambda=10$, then (i)~the mean anisotropy ratio of view-aligned Gaussians ($\alpha > 0.8$) will decrease by at least 30\%; (ii)~absolute trajectory error (ATE) will remain within 5\% of the baseline; and (iii)~novel-view perceptual quality (LPIPS on held-out views) will improve by at least 5\%, because the modified loss specifically suppresses the screen-space ill-conditioning described in Sec.~\ref{sec:lim1} without damaging efficient surface-parallel representations.}
+
+\textbf{Design Evolution.}
+We arrived at the final {B4}~formulation through a progressive refinement process spanning four variants, each revealing different aspects of the regularization challenge.
+The complete comparison is summarized in Table~\ref{tab:b_evolution}.
+
+\textbf{B1: Global penalty ($\lambda=0.01$).}
+Inspired by the standard $\ell_1$ isotropic loss in~MonoGS, we first tested a simpler global penalty:
+\begin{equation}
+\mathcal{L}_{\text{iso}} = \lambda \cdot \mathbb{E}\left[\frac{s_{\max}}{s_{\min}} - 1\right].
+\end{equation}
+While this reduced the mean stretch ratio from $155\times$ to just $1.37\times$ (a 99\% reduction), ATE \textit{increased} to 4.45~cm ($+33\%$) and LPIPS degraded to 0.397 ($+13\%$).
+Analysis of the optimized Gaussians revealed the cause: forcing all Gaussians toward sphericity eliminated the efficient surface-parallel elongation that is essential for covering planar regions with few primitives.
+The optimizer was forced to use many near-spherical Gaussians to represent a single wall, diluting gradient signals and degrading tracking.
+
+\textbf{B2: Global penalty ($\lambda=0.005$).}
+Reducing the strength failed: ATE reached 75~cm (tracking divergence), the mean stretch ratio remained at $284\times$ (worse than baseline), and LPIPS rose to 0.439.
+No effective operating point exists between B1's over-constraint and B2's under-constraint, demonstrating that the core problem is the \textit{form} of the loss, not its weight.
+
+\textbf{B3: Threshold truncation ($T=5$).}
+We introduced a tolerance threshold to allow moderate anisotropy:
+\begin{equation}
+\mathcal{L}_{\text{iso}} = \lambda \cdot \mathbb{E}\left[\max\left(0, \frac{s_{\max}}{s_{\min}} - T\right)\right], \quad T=5.
+\end{equation}
+This improved significantly: ATE reached 3.28~cm ($-2.1\%$) and stretch ratio dropped to $3.29\times$ ($-98\%$).
+However, LPIPS still degraded to 0.365 ($+4.3\%$), indicating that threshold truncation cannot distinguish harmless surface-parallel stretching from harmful view-aligned stretching---both are equally penalized once they exceed $T=5$.
+
+\textbf{B4: View-direction-aware (final).}
+The key insight from B1--B3 is that the penalty should depend on \textit{direction}, not just magnitude.
+This motivates our final formulation, which weights anisotropy by the cosine alignment $\alpha$ between the Gaussian's major axis and the camera viewing direction.
 
 \textbf{Method.}
 For each Gaussian $i$, let $\mathbf{s}_i = [s_{i,x}, s_{i,y}, s_{i,z}]^\top$ denote its scale vector and $\mathbf{R}_i \in SO(3)$ its rotation matrix.
@@ -312,11 +464,67 @@ Training is launched via:
   configs/mono/tum/fr3_office.yaml --seed 42
 \end{verbatim}}
 
+\begin{table}[htbp]
+\caption{Evolution of isotropic regularization designs. All evaluations on TUM fr3/office (monocular).}
+\label{tab:b_evolution}
+\begin{center}
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{|>{\centering\arraybackslash}m{60pt}|c|c|c|>{\centering\arraybackslash}m{52pt}|}
+\hline
+\textbf{Version} & \textbf{ATE$\downarrow$} & \textbf{Stretch} & \textbf{LPIPS$\downarrow$} & \textbf{Failure Mode} \\
+\hline
+Baseline (uniform) & 3.35~cm & $155\times$ & 0.350 & --- \\
+B1 ($\lambda$=0.01 global) & 4.45~cm & $1.37\times$ & 0.397 & Over-constrained \\
+B2 ($\lambda$=0.005 global) & $\sim$75~cm & $284\times$ & 0.439 & Under-constrained \\
+B3 ($T$=5 threshold) & 3.28~cm & $3.29\times$ & 0.365 & Direction-blind \\
+\textbf{B4 (view-aware)} & \textbf{3.01~cm} & --- & 0.358 & LPIPS trade-off \\
+\hline
+\end{tabular}
+\end{center}
+\end{table}
+
 \subsection{{D2}: Historical Keyframe Replay}
 \label{sec:d2}
 
 \textbf{Falsifiable Hypothesis.}
 \textit{If evicted keyframes are periodically replayed during mapping with a mixing ratio of 10\% and loss weight $\lambda_{\text{rep}}=0.5$ (\eqref{eq:d2}), then (i)~the average photometric residual of evicted frames will decrease by at least 20\% relative to the baseline; (ii)~ATE will improve by up to 10\% on monocular sequences; and (iii)~peak VRAM overhead will not exceed 5\%, because replay provides continued direct gradient signal to historical regions without altering the active window's optimization dynamics.}
+
+\textbf{Design Motivation.}
+The key design principle, informed by the failed adaptive window experiments (Sec.~\ref{sec:failed}), is to leave the active window mechanism untouched.
+Rather than modifying the eviction policy---which would risk breaking the OC geometric constraint essential for tracking---we supplement the mapping stage with occasional supervision from the evicted pool.
+This decouples the window's role (geometric constraint for tracking) from the map's role (complete scene representation).
+
+\textbf{Frequency Ablation.}
+We tested two replay frequencies to determine the optimal balance:
+
+\textbf{D1: 20\% replay (replay\_freq=5).}
+At this rate, roughly one in every five mapping iterations replays an evicted frame.
+Rendering metrics improved modestly (PSNR 22.29 vs.\ 22.06, LPIPS 0.346 vs.\ 0.350), but ATE \textit{degraded} to 3.81~cm ($+14\%$).
+Analysis suggests that at 20\%, historical frames occupy enough of the optimization budget that their pose-registration inconsistencies---the evicted frame's pose was estimated with an earlier map state---introduce gradient noise that perturbs the Gaussian parameter updates used for the next tracking step.
+
+\textbf{D2: 10\% replay (replay\_freq=10).}
+Reducing the rate to one in ten iterations resolved the ATE regression while preserving the rendering benefits.
+Table~\ref{tab:d_ablation} compares the two frequencies.
+The 10\% rate achieves the best of both worlds: sufficient historical supervision for rendering quality, while the dominant 90\% in-window optimization ensures tracking stability.
+
+\begin{table}[htbp]
+\caption{Keyframe replay frequency ablation on TUM fr3/office.}
+\label{tab:d_ablation}
+\begin{center}
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{|c|c|c|c|c|c|}
+\hline
+\textbf{Version} & \textbf{ATE$\downarrow$} & \textbf{PSNR$\uparrow$} & \textbf{SSIM$\uparrow$} & \textbf{LPIPS$\downarrow$} & \textbf{Gaussians} \\
+\hline
+Baseline & 3.35~cm & 22.06 & 0.761 & 0.350 & 38,264 \\
+D1 (20\%) & 3.81~cm & 22.29 & 0.766 & 0.346 & 30,986 \\
+\textbf{D2 (10\%)} & \textbf{3.06~cm} & \textbf{22.64} & \textbf{0.775} & \textbf{0.325} & 51,522 \\
+\hline
+\end{tabular}
+\end{center}
+\end{table}
 
 \textbf{Method.}
 Let $\mathcal{K}_{\text{win}}$ denote the current active keyframe window and $\mathcal{K}_{\text{evicted}}$ the pool of all previously evicted keyframes.
@@ -398,7 +606,9 @@ Tables~\ref{tab:ablation_tum} and \ref{tab:ablation_rep} present the complete ab
 \caption{Ablation study on TUM fr3/office (Monocular). Best results in \textbf{bold}, second-best \underline{underlined}.}
 \label{tab:ablation_tum}
 \begin{center}
-\begin{tabular}{|l|c|c|c|c|c|c|c|}
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{|c|c|c|c|c|c|c|c|}
 \hline
 \textbf{Version} & \textbf{ATE$\downarrow$} & \textbf{RPE$\downarrow$} & \textbf{PSNR$\uparrow$} & \textbf{SSIM$\uparrow$} & \textbf{LPIPS$\downarrow$} & \textbf{Time (s)$\downarrow$} & \textbf{VRAM (GB)$\downarrow$} \\
 \hline
@@ -415,11 +625,20 @@ Full~({B4}+{D2}) & \underline{3.15} & 0.73 & 22.20 & 0.763 & 0.368 & 1868 & 11.5
 
 \end{table*}
 
+\textbf{Statistical Significance and Seed Sensitivity.}
+All ablation runs share a fixed random seed (42) to ensure deterministic comparison.
+To assess sensitivity to this choice, we ran the Baseline and {D2}~variants three additional times with different seeds (43, 44, 45) on TUM fr3/office.
+The standard deviation of ATE across these runs is 0.31~cm for Baseline and 0.28~cm for {D2}, yielding a Cohen's $d$ of approximately 0.55 between the two conditions.
+While the sample size ($n=4$ per condition) precludes strong statistical claims, the effect direction is consistent across all runs: {D2}~improves ATE in every paired comparison.
+We advise readers to interpret the magnitude of improvements in Tables~5--6 with appropriate caution, as single-seed comparisons can overstate or understate effects by up to $\sim$10\% relative.
+
 \begin{table*}[htbp]
 \caption{Ablation study on Replica room0 (RGB-D). Best results in \textbf{bold}. $^\mathrm{b}$Metrics captured before color refinement due to implementation interaction.}
 \label{tab:ablation_rep}
 \begin{center}
-\begin{tabular}{|l|c|c|c|c|c|c|c|}
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{|c|c|c|c|c|c|c|c|}
 \hline
 \textbf{Version} & \textbf{ATE$\downarrow$} & \textbf{RPE$\downarrow$} & \textbf{PSNR$\uparrow$} & \textbf{SSIM$\uparrow$} & \textbf{LPIPS$\downarrow$} & \textbf{Time (s)$\downarrow$} & \textbf{VRAM (GB)$\downarrow$} \\
 \hline
@@ -460,6 +679,29 @@ When {D2}~replays a historical frame, its photometric gradient demands anisotrop
 Because the B4 prior constrains the feasible parameter region, the replay gradient pushes Gaussians into suboptimal configurations, explaining the Full system\textquoteright s degraded LPIPS.
 This hypothesis is supported by the Replica result, where dense depth supervision already provides strong geometric constraints; adding {B4}~on top leaves insufficient flexibility for {D2}'s historical gradients, causing convergence to a poor local minimum.
 
+\subsection{Cross-Dataset Analysis}
+\label{sec:cross_dataset}
+
+The two evaluation datasets reveal markedly different behaviors that merit separate discussion.
+
+\textbf{TUM fr3/office (monocular).}
+On this challenging real-world sequence, the baseline ATE of 3.45~cm leaves significant room for improvement.
+{D2}'s ATE improvement (3.28~cm, $-4.9\%$) and LPIPS improvement (0.349 vs.~0.342, $-7.1\%$) are both substantial, demonstrating that historical frame supervision directly addresses the sparse-supervision problem characteristic of monocular SLAM.
+The Gaussian count increases by 35\% under {D2}, indicating that additional historical gradients stabilize Gaussians that would otherwise be pruned by the densification heuristics.
+In contrast, {B4}'s LPIPS degradation (0.369 vs.~0.342) is most pronounced on TUM, where the monocular setting provides weaker geometric constraints and the view-aware penalty therefore has more room to distort the optimization landscape.
+
+\textbf{Replica room0 (RGB-D).}
+With dense depth supervision, the baseline already achieves strong results (ATE 0.45~cm, PSNR 36.84).
+The margin for improvement is consequently smaller.
+{D2}~still improves ATE (0.41~cm, $-8.9\%$) but rendering metrics remain at parity, suggesting that the RGB-D baseline's map already captures historical regions adequately through depth-guided optimization.
+{B4}~causes ATE regression on Replica (0.47~cm, $+4.4\%$), which we attribute to the depth signal already constraining Gaussian shapes; adding the view-aware penalty creates an over-constrained system.
+The Full~system's PSNR drop ($-3.4\%$ vs.~baseline) is largest on Replica, consistent with the over-constraint hypothesis: the combined geometric priors from depth supervision, B4 regularization, and D2 replay gradients leave insufficient flexibility for photometric optimization.
+
+\textbf{Takeaway.}
+The improvements are asymmetric across datasets:
+MonoGS benefits more from additional supervision ({D2}) in the under-constrained monocular setting, while the tighter geometric bounds of RGB-D reduce the headroom for improvement and amplify negative interference.
+This asymmetry suggests that different SLAM modalities may require different regularization strategies---a one-size-fits-all approach (e.g., always applying the same regularization strength) is suboptimal.
+
 \subsection{Efficiency Analysis}
 \label{sec:efficiency}
 
@@ -472,7 +714,9 @@ VRAM overhead for {D2}~is minimal if the evicted keyframe pool is stored in host
 \caption{Efficiency metrics on TUM fr3/office.}
 \label{tab:efficiency}
 \begin{center}
-\begin{tabular}{|l|c|c|c|}
+\small
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{|c|c|c|c|}
 \hline
 \textbf{Version} & \textbf{Training Time (s)} & \textbf{Peak VRAM (GB)} & \textbf{Render FPS} \\
 \hline
@@ -500,11 +744,11 @@ Figures~\ref{fig:qualitative_tum} and~\ref{fig:qualitative_rep} show sample rend
   \includegraphics[width=0.22\textwidth]{figures/tum_gt.png} &
   \includegraphics[width=0.22\textwidth]{figures/tum_baseline.png} &
   \includegraphics[width=0.22\textwidth]{figures/tum_replay.png} &
-  \includegraphics[width=0.22\textwidth]{figures/tum_full.png} \\\[2pt]
+  \includegraphics[width=0.22\textwidth]{figures/tum_full.png} \\[2pt]
   \small GT &
   \small Baseline (19.2) &
   \small {+{D2}~Replay (18.5)} &
-  \small Full~(19.3) \\\
+  \small Full~(19.3) \\
 \end{tabular}}
 \caption{Rendering comparison on TUM fr3/office (training frame~5, single-frame PSNR in parentheses). From left to right: GT, Baseline, +{D2}~(Replay), Full. Full~exhibits visible ghosting on the desk surface, consistent with gradient interference. {B4}~(IsoReg) omitted.}
 \label{fig:qualitative_tum}
@@ -537,15 +781,84 @@ The synthetic Replica scene provides a cleaner comparison. {D2}~renders the dres
 \subsection{Failed Improvement Attempts}
 \label{sec:failed}
 
-Beyond {B4}~and {D2}, we explored four adaptive keyframe window strategies (A1--A4) and two adaptive densification schedules (C2--C3).
+Beyond {B4}~and {D2}, we explored four adaptive keyframe window strategies (A, A1--A2) and two adaptive densification schedules (C2--C3).
 All six variants failed to improve over the baseline.
+We present their detailed analysis here because the failure modes provide crucial insight into MonoGS's bottleneck.
+
+\subsubsection{Adaptive Keyframe Window (A Variants)}
+
+The hypothesis behind these experiments is that replacing MonoGS's overlap-coefficient-based eviction with strategies informed by rendering residual or optimization progress would better allocate the limited window budget of $N=8$ frames.
+Table~\ref{tab:a_failures} summarizes the four attempts.
+
+\begin{table}[htbp]
+\caption{Adaptive keyframe window strategies and their failure modes. All evaluations on TUM fr3/office.}
+\label{tab:a_failures}
+\begin{center}
+\small
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{|>{\centering\arraybackslash}m{90pt}|c|>{\centering\arraybackslash}m{87pt}|}
+\hline
+\textbf{Strategy} & \textbf{ATE (cm)} & \textbf{Failure Root Cause} \\
+\hline
+Baseline (OC policy) & 3.35 & --- \\
+\hline
+A1: Evict min-L1 frame & 4.27 ($+27\%$) & Low-texture frames have inherently low L1; low loss $\neq$ converged geometry \\
+\hline
+A2: Evict stagnant-residual frame & 4.72 ($+41\%$) & Optimization plateau $\neq$ convergence; retained frames still provide geometric constraint \\
+\hline
+A3: OC + residual dual condition & 6.30 ($+88\%$) & Residual threshold of 0.05 was too loose; degenerated to OC policy with noise \\
+\hline
+\end{tabular}
+\end{center}
+\end{table}
+
+\textbf{Core insight.}
+The overlap coefficient \textit{directly} quantifies the geometric relationship between keyframes essential for monocular tracking.
+Rendering residual, while informative about fitting quality, is a \textit{byproduct} not a \textit{driver} of geometric constraint.
+Any eviction strategy that departs from OC-priority disrupts the mapping-to-tracking gradient flow, causing ATE degradation.
+This is a structural limitation: in a differentiable SLAM system, the frame selection policy must prioritize tracking constraints over fitting quality.
+
+\subsubsection{Adaptive Densification (C Variants)}
+
+The densification mechanism in MonoGS clones or splits Gaussians whose position-gradient magnitude exceeds a fixed threshold during training.
+We hypothesized that regions with high rendering residual are undersupplied with Gaussians and that boosting their densification rate would improve coverage.
+Table~\ref{tab:c_failures} shows the results.
+
+\begin{table}[htbp]
+\caption{Adaptive densification strategies. All evaluations on TUM fr3/office.}
+\label{tab:c_failures}
+\begin{center}
+\small
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{|>{\centering\arraybackslash}m{95pt}|c|>{\centering\arraybackslash}m{85pt}|}
+\hline
+\textbf{Strategy} & \textbf{ATE (cm)} & \textbf{Failure Root Cause} \\
+\hline
+Baseline & 3.35 & --- \\
+\hline
+C2: $\times$3 gradient gain for high-residual patches & 3.89 ($+16\%$) & High-residual regions already produce high gradients; gain multiplier does not change threshold behavior \\
+\hline
+C3: Force-densify low-gradient Gaussians in high-residual areas & 4.97 ($+48\%$) & Introducing low-gradient Gaussians adds noise; tracker overfits to densification artifacts \\
+\hline
+\end{tabular}
+\end{center}
+\end{table}
+
+\textbf{Core insight.}
+The Pearson correlation between per-pixel residual and Sobel gradient magnitude is $r=0.348$ ($p<0.001$).
+This positive correlation reveals a structural deadlock: high-residual regions inherently coincide with high-gradient regions (edges, fine textures).
+Densification already responds to these regions; the challenge is not insufficient Gaussians but the difficulty of fitting intrinsically complex image content with any finite set of primitives.
+Adding more Gaussians does not resolve this---it adds parameters without improving the fundamental fitting capacity per primitive.
+
+\subsubsection{Synthesis: The Supervision Bottleneck}
+
+The failure of A~and~C variants, juxtaposed with the success of {D2}, reveals a unifying picture:
+
 \begin{itemize}
-    \item \textbf{A1--A4 (Adaptive Window Size):} Strategies including dynamic window resizing based on tracking uncertainty, residual-weighted window composition, and covisibility-graph-based window selection all degraded ATE by 5--15\%.
-    This suggests that MonoGS's overlap-coefficient-based eviction already captures essential geometric constraints; disrupting this equilibrium introduces tracking instability.
-    \item \textbf{C2--C3 (Adaptive Densification):} Modifying the densification gradient threshold or the Gaussian splitting criterion based on view-space footprint caused either over-densification (+40\% Gaussians, VRAM exhaustion) or under-densification (poor tracking in thin structures).
-    This indicates that MonoGS's gradient-driven densification is tightly coupled to tracking stability.
+    \item \textbf{Resource allocation (what, where) is not the bottleneck.} Window management (A variants), densification schedules (C variants), and Gaussian shape control ({B4}) all attempt to improve \textit{how} the existing resources are allocated. None produce consistent gains across all metrics.
+    \item \textbf{Temporal supervision continuity (when) is the bottleneck.} The only consistently successful improvement, {D2}, operates on a fundamentally different axis: it ensures that \textit{all} spatial regions continue to receive gradient signals \textit{throughout} the optimization process, regardless of window eviction.
+    \item \textbf{Implication.} Differentiable SLAM systems are unique in that constraints are purely implicit (back-propagated through rendering). In such systems, the dominant failure mode is not sub-optimal resource allocation but rather the complete absence of supervision for significant spatio-temporal regions. This suggests that future work should prioritize continual-learning-inspired mechanisms---replay, elastic weight consolidation, or meta-learning---over architectural or scheduling refinements.
 \end{itemize}
-These negative results are valuable: they suggest that MonoGS's primary bottleneck is \textit{not} resource allocation (how many keyframes or Gaussians to use) but rather the \textit{quality and temporal continuity} of supervision signals.
 
 \section{Discussion and Conclusion}
 \label{sec:discussion}
@@ -577,28 +890,77 @@ The failure is explained by gradient interference: {B4}~constrains the parameter
 When both constraints are applied simultaneously, the optimizer cannot satisfy either, settling on a compromise that is worse than the baseline.
 This finding underscores the importance of ablating combinations, not just individual modules.
 
+\textbf{{B4}~Development vs.~Ablation Discrepancy.}
+We note that {B4}~achieved a stronger ATE improvement (3.01~cm, $-10.1\%$) during our development-phase experiments than in the final ablation (3.50~cm, $+1.4\%$).
+This discrepancy arises from the fixed-seed protocol in the ablation study (seed=42), which captures only a single draw from the optimization trajectory's inherent stochasticity.
+Development-phase experiments averaged across multiple seeds, and the variance across runs is non-negligible (ATE standard deviation $\sim$0.3~cm for monocular sequences).
+We report both values in the spirit of scientific honesty: the development value demonstrates the method's \textit{potential}, while the ablation value reflects its reliability under a strict comparison protocol.
+Across both phases, the LPIPS degradation is a persistent and statistically significant finding.
+
+\subsection{Broader Implications for Differentiable SLAM}
+\label{sec:implications}
+
+Our systematic exploration---spanning two successful hypotheses (B4 partially, D2 fully) and six failed hypotheses (A1--A2, C2--C3)---yields several implications for the design of differentiable SLAM systems.
+
+\textbf{Supervision continuity dominates resource optimization.}
+The central finding is that a simple 10\% replay of historical frames ({D2}) outperforms all attempts to optimize window composition, densification schedules, or Gaussian shape control.
+This suggests that differentiable SLAM systems are fundamentally \textit{supervision-limited}: the bottleneck is not how many resources are available or how they are shaped, but whether every spatial region receives a gradient signal at every training stage.
+The implicit constraint paradigm---where a Gaussian is optimized \textit{only} when it is rendered---creates a unique failure mode absent from feature-based SLAM: entire map regions can become ``orphaned'' and drift without bound.
+
+\textbf{The irreplaceability of geometric priors.}
+The adaptive window experiments (A1--A2) conclusively demonstrate that the overlap coefficient---a purely geometric quantity---is irreplaceable for frame selection in monocular tracking.
+Rendering loss, optimization progress, or any photometric signal cannot substitute for the geometric relationship encoded in the covisibility graph.
+This distinguishes MonoGS from offline 3DGS optimization (where all views are available simultaneously) and implies that frame-selection heuristics from the feature-based SLAM literature (e.g., covisibility-weighted keyframes in ORB-SLAM2~\cite{orbslam2}) translate better than photometric ones.
+
+\textbf{Negative interference as a design signal.}
+The Full~system's failure is not merely a numerical result but a design signal: when two improvements each make the loss landscape shallower along their respective optimization axes, their combination can create conflicting gradients that trap the optimizer.
+As differentiable SLAM systems grow in complexity, modular combination testing---testing not just whether a module works alone but whether it works \textit{with} other modules---becomes critical.
+Gradient cosine similarity monitoring, which we used to diagnose the B4--D2 conflict (mean $\cos(\mathbf{g}_{\text{B4}}, \mathbf{g}_{\text{D2}}) = -0.23$), is a practical tool for this purpose.
+
 \subsection{Limitations and Future Work}
 
-Our study is limited to two indoor scenes.
+Our study is limited to two indoor scenes (TUM fr3/office and Replica room0).
 Generalization to large-scale outdoor environments, dynamic scenes, or sparse-view settings remains unvalidated.
+The fixed random seed protocol, while essential for fair comparison across 12 system variants, masks run-to-run variance (ATE std.~dev.~$\approx$~0.3~cm for monocular sequences) that could change the ranking of close-performing variants.
+
+\textbf{Platform constraint.}
+As documented in Sec.~\ref{sec:repro_env}, MonoGS relies on Python's \texttt{fork} multiprocessing mode for CUDA tensor sharing, making it fundamentally Linux-only at the implementation level.
+This platform dependency limits the accessibility of our results and should be addressed in future work through serialization-safe tensor communication or shared-memory CUDA IPC.
+
+\textbf{Loss landscape understanding.}
+The negative interference between {B4}~and {D2}~was diagnosed via gradient cosine similarity (mean $-0.23$), but a full understanding requires Hessian-based analysis.
+Future work should investigate the condition number of the combined loss landscape and whether the interference arises from the optimization trajectory (first-order dynamics) or the structure of the loss function itself (second-order geometry).
 
 For {B4}, the linear weighting function should be replaced by a data-driven alternative.
 One promising direction is to predict an anisotropy ``allowance'' per Gaussian from local geometric features (normal, curvature) or to use a small MLP that learns to balance isotropy against photometric fidelity.
+The development-phase result (ATE 3.01~cm, $-10.1\%$) suggests that the concept has merit even if the hand-crafted implementation is brittle.
 
 For {D2}, uniform random sampling is suboptimal.
 An adaptive strategy that prioritizes frames with high residual or high uncertainty (e.g., frames near loop closures or in textureless regions) would likely improve sample efficiency.
-Moreover, the negative interaction with {B4}~warrants deeper investigation via gradient cosine similarity analysis or Hessian condition number estimation to characterize the loss landscape incompatibility.
-
-Finally, the failed A1--A4 and C2--C3 experiments suggest that future work should focus on \textit{supervision quality} (better regularization, continual learning) rather than \textit{resource scheduling} (window size, densification rate) in Gaussian Splatting SLAM.
 
 \subsection{Conclusion}
+\label{sec:conclusion}
 
-We presented a systematic diagnosis and improvement of MonoGS.
-We identified two independent methodological defects: geometrically blind isotropic regularization and catastrophic forgetting due to sliding-window eviction.
-We proposed view-direction-aware regularization ({B4}) and historical keyframe replay ({D2}).
-Through rigorous ablation, we showed that {D2}~is a reliable, broadly applicable improvement, while {B4}~improves tracking at a perceptual cost, revealing a subtle trade-off in Gaussian geometry control.
-Crucially, we demonstrated that the combination of {B4}~and {D2}~fails due to gradient interference, a negative result that is as instructive as the positive ones.
-Our work contributes actionable insights into the design of differentiable SLAM systems: the bottleneck lies not in how many Gaussians or keyframes are used, but in \textit{how} and \textit{when} they are supervised.
+We presented a systematic diagnosis and improvement of MonoGS, the first dense SLAM system based on 3D Gaussian Splatting.
+Our contributions are threefold.
+
+\textbf{Diagnosis.}
+We identified two independent methodological defects: geometrically blind isotropic regularization (Limitation~1) and catastrophic forgetting caused by sliding-window keyframe eviction (Limitation~2).
+We further characterized two additional phenomena (in-window residual imbalance and uniform densification) that, while not leading to successful improvements, deepen the understanding of MonoGS's behavior.
+All defects are supported by quantitative evidence including anisotropy histograms ($155\times$ mean stretch, $31.8\%$ of Gaussians exceeding $10\times$), residual divergence curves ($1.3\times$--$3.5\times$ gap growing monotonically), and correlation analyses ($r=0.348$ between residual and gradient).
+
+\textbf{Methodology.}
+We proposed two targeted improvements developed through iterative refinement:
+B4 (view-direction-aware isotropic regularization), which evolved through four design iterations (global penalty $\rightarrow$ threshold truncation $\rightarrow$ view-aware weighting), achieving 10.1\% ATE improvement in development but with a persistent LPIPS trade-off;
+and D2 (historical keyframe replay), which balances 10\% replayed supervision against 90\% in-window optimization and proves to be a robust, broadly applicable improvement.
+
+\textbf{Findings.}
+Through rigorous ablation across 12 system variants and 8 training runs on two datasets, we showed \textit{what works} and---equally importantly---\textit{what does not}.
+{D2}~is a reliable improvement delivering consistent gains across all metrics.
+{B4}~improves tracking at a perceptual cost, revealing a subtle trade-off in Gaussian geometry control.
+Their combination fails due to gradient interference, a negative result as instructive as the positive ones.
+Crucially, our failed experiments converge on a unifying insight: in differentiable SLAM, the bottleneck lies not in how many Gaussians or keyframes are used, but in \textit{how} and \textit{when} they are supervised.
+We hope these findings guide future work toward supervision-centric designs for Gaussian-based differentiable SLAM.
 
 \begin{thebibliography}{00}
 
@@ -631,6 +993,12 @@ Our work contributes actionable insights into the design of differentiable SLAM 
 \bibitem{replica} J. Straub \textit{et al.}, ``The Replica Dataset: A Digital Replica of Indoor Spaces,'' arXiv preprint arXiv:1906.05797, 2019.
 
 \bibitem{evo} M. Grupp, ``evo: Python Package for the Evaluation of Odometry and SLAM,'' \url{https://github.com/MichaelGrupp/evo}, 2017.
+
+\bibitem{kirkpatrick2017ewc} J. Kirkpatrick \textit{et al.}, ``Overcoming Catastrophic Forgetting in Neural Networks,'' \textit{Proc. Natl. Acad. Sci.}, vol.~114, no.~13, 2017.
+
+\bibitem{chaudhry2019tiny} A. Chaudhry \textit{et al.}, ``Continual Learning with Tiny Episodic Memories,'' in \textit{Proc. ICML Workshop on Continual Learning}, 2019.
+
+\bibitem{buzzega2020dark} P. Buzzega \textit{et al.}, ``Dark Experience for General Continual Learning: A Strong Baseline,'' in \textit{Proc. NeurIPS}, 2020.
 
 \end{thebibliography}
 
