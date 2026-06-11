@@ -2,6 +2,10 @@ import json
 import os
 
 import cv2
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from utils.logging_utils import Log
 import evo
 import numpy as np
 import torch
@@ -45,6 +49,19 @@ def evaluate_evo(poses_gt, poses_est, plot_dir, label, monocular=False):
         encoding="utf-8",
     ) as f:
         json.dump(ape_stats, f, indent=4)
+
+    ## RPE
+    rpe_metric = metrics.RPE(pose_relation)
+    rpe_metric.process_data(data)
+    rpe_stats = rpe_metric.get_all_statistics()
+    rpe_stat = rpe_metric.get_statistic(metrics.StatisticsType.rmse)
+    Log("RMSE RPE \[m]", rpe_stat, tag="Eval")
+    with open(
+        os.path.join(plot_dir, "stats_rpe_{}.json".format(str(label))),
+        "w",
+        encoding="utf-8",
+    ) as f:
+        json.dump(rpe_stats, f, indent=4)
 
     plot_mode = evo.tools.plot.PlotMode.xy
     fig = plt.figure()
@@ -158,6 +175,23 @@ def eval_rendering(
         psnr_array.append(psnr_score.item())
         ssim_array.append(ssim_score.item())
         lpips_array.append(lpips_score.item())
+
+    # Save render comparison PNGs (every 50th frame)
+    render_dir = os.path.join(save_dir, "renders", str(iteration))
+    mkdir_p(render_dir)
+    for _ri in range(0, len(saved_frame_idx), max(1, len(saved_frame_idx) // 10)):
+        _fid = saved_frame_idx[_ri]
+        _fig, _ax = plt.subplots(1, 2, figsize=(12, 5))
+        _ax[0].imshow(img_gt[_ri])
+        _ax[0].set_title(f"GT frame {_fid}")
+        _ax[0].axis("off")
+        _ax[1].imshow(img_pred[_ri])
+        _ax[1].set_title(f"Render frame {_fid} (PSNR: {psnr_array[_ri]:.1f})")
+        _ax[1].axis("off")
+        plt.tight_layout()
+        _fig.savefig(os.path.join(render_dir, f"frame_{_fid:04d}.png"), dpi=100, bbox_inches="tight")
+        plt.close(_fig)
+    Log(f"[RenderSaves] saved {min(10, len(saved_frame_idx))} render PNGs to {render_dir}", tag="Eval")
 
     output = dict()
     output["mean_psnr"] = float(np.mean(psnr_array))

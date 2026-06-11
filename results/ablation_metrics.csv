@@ -1,0 +1,9 @@
+scene,version,ate_cm,rpe_cm,psnr,ssim,lpips,vram_mb
+TUM fr3/office,tum_imp1,3.45,0.72,22.36,0.766,0.342,1055
+TUM fr3/office,tum_imp2,3.50,0.77,22.39,0.766,0.369,1070
+TUM fr3/office,tum_imp3,3.28,0.69,22.12,0.762,0.349,1088
+TUM fr3/office,tum_imp4,3.15,0.73,22.20,0.763,0.368,1071
+Replica room0,rep_imp1,0.45,0.27,36.84,0.968,0.049,5312
+Replica room0,rep_imp2,0.47,0.24,35.78,0.962,0.059,5322
+Replica room0,rep_imp3,0.41,0.28,36.65,0.968,0.047,5298
+Replica room0,rep_imp4,0.44,0.21,35.59,0.961,0.059,5185

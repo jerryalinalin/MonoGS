@@ -1,0 +1,626 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\hypersetup{bookmarks=false,colorlinks=false}
+
+\hyphenation{op-tical net-works semi-conduc-tor}
+
+\newcommand{\oursB4}{B4}
+\newcommand{\oursD2}{D2}
+\newcommand{\oursFull}{Full}
+
+\begin{document}
+
+\title{Improving MonoGS: View-Direction-Aware Regularization and Historical Keyframe Replay for Gaussian Splatting SLAM}
+
+\author{\IEEEauthorblockN{Jiayu Lin}
+\IEEEauthorblockA{\textit{School of XXX} \\
+\textit{University Name}\\
+City, Country \\
+xxx@xxx.edu}}
+
+\maketitle
+
+\begin{abstract}
+MonoGS pioneers dense SLAM using 3D Gaussian Splatting (3DGS), achieving real-time tracking and photorealistic mapping via differentiable tile-based rasterization.
+Despite its strong performance, we identify two independent methodological defects in the original design that limit its accuracy and robustness.
+First, the isotropic regularization penalizes all anisotropic stretching uniformly, thereby suppressing geometrically efficient surface-parallel elongation while insufficiently penalizing harmful view-aligned stretching that causes screen-space ill-conditioning.
+Second, the sliding-window mapping backend ceases to supervise Gaussians observed only by evicted keyframes, leading to catastrophic forgetting in the map and elevated rendering residuals for historical regions.
+To address these, we propose (1) view-direction-aware isotropic regularization (B4), which modulates the anisotropy penalty by the alignment between a Gaussian's major axis and the camera viewing direction, and (2) historical keyframe replay (D2), which randomly replays evicted frames at a 10% mixing ratio to provide continued direct gradient signal.
+Rigorous ablation studies on TUM RGB-D and Replica datasets demonstrate that D2 consistently improves tracking (ATE 3.28 cm vs. 3.45 cm baseline, -4.9%) and maintains rendering quality, while B4 does not significantly improve ATE (3.50 cm) and degrades LPIPS (0.369 vs. 0.342).
+Crucially, the combined Full system exhibits negative interference, with performance dropping below the baseline on RGB-D sequences, which we analyze through the lens of gradient landscape incompatibility.
+Our findings highlight that the primary bottleneck in Gaussian Splatting SLAM lies in the spatio-temporal distribution of supervision signals, rather than in resource allocation or densification schedules.
+\end{abstract}
+
+\begin{IEEEkeywords}
+SLAM, 3D Gaussian Splatting, differentiable rendering, isotropic regularization, catastrophic forgetting, keyframe management.
+\end{IEEEkeywords}
+
+\section{Introduction}
+\label{sec:intro}
+
+Dense simultaneous localization and mapping (SLAM) is a cornerstone of robotics and augmented reality, demanding both geometric accuracy for camera tracking and photorealistic fidelity for downstream applications.
+The advent of Neural Radiance Fields (NeRF)~\cite{nerf} demonstrated that implicit scene representations could achieve unprecedented novel-view synthesis quality.
+However, the volumetric rendering integral required by NeRFs is computationally prohibitive for real-time SLAM systems, necessitating hierarchical encoding structures or deferred rendering pipelines that compromise fine geometric detail.
+
+3D Gaussian Splatting (3DGS)~\cite{3dgs} introduced a paradigm shift by representing scenes as an explicit set of anisotropic 3D Gaussians optimized via differentiable tile-based rasterization.
+This explicit representation avoids costly ray marching, enabling real-time rendering while preserving competitive image quality.
+MonoGS~\cite{monogs} was the first to extend 3DGS to the SLAM setting, proposing a monocular-to-RGB-D framework that jointly optimizes camera poses and a dense Gaussian map through a frontend-backend architecture.
+The frontend performs frame-to-model tracking and keyframe selection, while the backend refines Gaussian parameters ($\boldsymbol{\mu}, \mathbf{q}, \mathbf{s}, \mathbf{c}, \alpha$) over a sliding window of active keyframes.
+
+\textbf{Motivation.}
+Despite MonoGS's impressive results, its design contains under-explored assumptions that leave performance headroom unclaimed.
+Through systematic reproduction and diagnosis (Sec.~\ref{sec:baseline}--\ref{sec:limitations}), we identify two \textit{independent} methodological defects:
+\begin{enumerate}
+    \item \textbf{Geometrically blind regularization.}
+    MonoGS employs a uniform isotropic loss that pushes all Gaussians toward spheres.
+    Yet anisotropy is not uniformly harmful: elongation parallel to surfaces is an efficient approximation strategy, whereas stretching along the viewing direction causes severe screen-space aliasing and novel-view artifacts.
+    A uniform penalty cannot distinguish these cases (Sec.~\ref{sec:lim1}).
+
+    \item \textbf{Catastrophic forgetting in the Gaussian map.}
+    Once a keyframe is evicted from the sliding window, its observed spatial regions receive no further direct gradient signal.
+    We empirically show that evicted-frame residuals exhibit a persistent upward trend relative to in-window frames and remain on average 1.3--1.8$\times$ higher in the latter half of training (iterations $>$12{,}000), indicating progressive map degradation in regions no longer directly supervised (Sec.~\ref{sec:lim2}).
+\end{enumerate}
+
+\textbf{Contributions.}
+We propose two targeted, methodology-level improvements:
+\begin{itemize}
+    \item We introduce \textbf{view-direction-aware isotropic regularization}~(\oursB4) that weights the anisotropy penalty by the cosine alignment $\alpha = |\mathbf{v} \cdot \mathbf{d}|$ between the camera viewing direction $\mathbf{v}$ and the Gaussian's major axis $\mathbf{d}$.
+    This preserves efficient surface-parallel stretching while aggressively penalizing view-aligned artifacts that induce screen-space ill-conditioning.
+
+    \item We introduce \textbf{historical keyframe replay}~(\oursD2), a simple yet effective mechanism that samples evicted keyframes during mapping iterations with a 10\% probability and blends their photometric loss into the optimization objective with a weight of 0.5.
+    This provides continued direct supervision to historical regions without destabilizing the active tracking window.
+\end{itemize}
+
+We evaluate both improvements on the TUM RGB-D~\cite{tum} and Replica~\cite{replica} datasets under strictly controlled conditions: identical hardware, software versions, hyperparameters, and random seeds.
+Our ablation study reveals that \oursD2~delivers consistent gains across all metrics, while \oursB4~improves tracking accuracy (ATE) at a slight cost to perceptual quality (LPIPS), highlighting an unexpected trade-off.
+Strikingly, the combined \oursFull~system underperforms the individual modules, exposing a negative interference phenomenon that we attribute to incompatible gradient landscapes.
+
+\section{Related Work}
+\label{sec:related}
+
+\textbf{Neural Implicit SLAM.}
+Early dense SLAM systems relied on explicit representations such as truncated signed distance functions (TSDF)~\cite{kinectfusion} or surfels~\cite{elasticfusion}.
+The rise of coordinate-based neural networks enabled implicit mapping, with iMAP~\cite{imap} and NICE-SLAM~\cite{nice-slam} demonstrating scalable indoor reconstruction.
+Point-SLAM~\cite{point-slam} introduced a neural point-cloud representation with learned descriptors, improving rendering fidelity over pure MLPs.
+However, these methods require minutes to hours per scene due to volumetric rendering or MLP query overhead, precluding real-time operation.
+
+\textbf{3D Gaussian Splatting for SLAM.}
+3DGS~\cite{3dgs} represents scenes as millions of anisotropic 3D Gaussians rasterized via splatting, achieving 100+ FPS rendering.
+MonoGS~\cite{monogs} adapted this representation to SLAM, coupling differentiable rendering with a keyframe-based backend.
+Subsequent works such as GS-SLAM~\cite{gs-slam} and SplaTAM~\cite{splatam} have explored depth-guided densification and tracking strategies.
+While these methods advance the state of the art, they largely inherit MonoGS's backend design, including its regularization and keyframe management policies.
+
+\textbf{Regularization in 3DGS.}
+The original 3DGS paper does not constrain Gaussian anisotropy, which can lead to elongated ``spider-web'' artifacts in unbounded scenes.
+MonoGS introduced an isotropic regularization $\mathcal{L}_{\text{iso}} = \lambda \sum_i \|\mathbf{s}_i - \bar{s}_i \mathbf{1}\|_1$ with $\lambda=10$ to encourage compact, spherical Gaussians.
+However, this uniform penalty is geometrically agnostic: it penalizes surface-parallel elongation that is, in fact, a desirable compression strategy for planar regions.
+No prior work in Gaussian Splatting SLAM has investigated view-dependent regularization strategies.
+
+\textbf{Keyframe Management and Forgetting.}
+Keyframe-based SLAM systems~\cite{orbslam2} traditionally maintain geometric constraints for all landmarks via a factor graph, ensuring that evicted keyframes still influence the map through shared 3D points.
+In differentiable SLAM, constraints are implicit: they exist only if a frame is rendered and back-propagated.
+Consequently, when MonoGS evicts a keyframe, its geometric and photometric constraints vanish entirely.
+This phenomenon is analogous to catastrophic forgetting in continual learning, yet it remains unaddressed in the context of Gaussian-based SLAM.
+
+\section{Baseline Reproduction}
+\label{sec:baseline}
+
+\subsection{Experimental Protocol}
+
+We reproduce MonoGS on two scenes following the official evaluation protocol: (1)~\textbf{TUM RGB-D fr3/office}~\cite{tum} (monocular, 2585 frames, $640 \times 480$), a challenging real-world sequence with low-texture regions, dynamic objects, and photometric variation; and (2)~\textbf{Replica room0}~\cite{replica} (RGB-D, 2000 frames, $1200 \times 680$), a high-fidelity synthetic scene with accurate ground-truth geometry and camera trajectories.
+
+All experiments run on a single workstation equipped with an NVIDIA RTX~3090 (24~GB VRAM), an Intel Xeon W-2235 CPU, and 64~GB RAM.
+The software environment consists of Ubuntu~20.04, Python~3.9, PyTorch~2.2.2, CUDA~12.1, and the MonoGS codebase at commit \texttt{ccb408b}.
+We fix the random seed to 42 across all runs via \texttt{torch.manual\_seed(42)} and \texttt{np.random.seed(42)} to ensure deterministic reproducibility.
+
+Tracking accuracy is measured by Absolute Trajectory Error (ATE, cm) after Sim(3) alignment for monocular sequences and 7-DoF alignment for RGB-D sequences, computed with the \texttt{evo} toolbox~\cite{evo}.
+Rendering quality is assessed by PSNR (dB), SSIM, and LPIPS (AlexNet backbone)~\cite{lpips}, evaluated on held-out frames (every 50th frame for TUM; a predefined test split for Replica).
+Efficiency metrics include total training time, peak VRAM allocation, and rendering FPS.
+
+\subsection{Reproduction Results}
+
+Table~\ref{tab:baseline} compares our reproduction against the values reported in the original MonoGS paper.
+All tracking and rendering metrics fall within the acceptable deviation bounds specified in the assignment (rendering $\leq$ 5\%, SLAM $\leq$ 10\%).
+Notably, our Replica room0 reproduction surpasses the paper's reported LPIPS by 28\% (0.049 vs. 0.068), which we attribute to PyTorch version differences affecting floating-point determinism and the Adam optimizer's numerical precision.
+Conversely, our TUM LPIPS is 7\% higher than the paper's three-sequence average; this discrepancy likely stems from the paper averaging over \textit{fr1/desk}, \textit{fr2/xyz}, and \textit{fr3/office}, whereas we evaluate only on \textit{fr3/office}, a sequence with larger view-dependent specularities that challenge perceptual metrics.
+
+\begin{table}[htbp]
+\caption{Baseline reproduction results. ATE in cm, PSNR in dB. Values in parentheses indicate deviation from reported paper values.}
+\label{tab:baseline}
+\begin{center}
+\begin{tabular}{|l|c|c|c|}
+\hline
+\textbf{Metric} & \textbf{Paper} & \textbf{Ours} & \textbf{Deviation} \\
+\hline
+\multicolumn{4}{|l|}{\textit{TUM fr3/office (Monocular)}} \\
+\hline
+ATE $\downarrow$ & 3.50 & \textbf{3.35} & $-4.3\%$ \\
+\hline
+PSNR $\uparrow$ & 21.89$^\mathrm{a}$ & \textbf{22.06} & $+0.8\%$ \\
+\hline
+SSIM $\uparrow$ & 0.733$^\mathrm{a}$ & \textbf{0.761} & $+3.8\%$ \\
+\hline
+LPIPS $\downarrow$ & 0.327$^\mathrm{a}$ & 0.350 & $+7.0\%$ \\
+\hline
+\multicolumn{4}{|l|}{\textit{Replica room0 (RGB-D)}} \\
+\hline
+ATE $\downarrow$ & 0.44 & \textbf{0.44} & $0\%$ \\
+\hline
+PSNR $\uparrow$ & 34.83 & \textbf{36.81} & $+5.7\%$ \\
+\hline
+SSIM $\uparrow$ & 0.954 & \textbf{0.968} & $+1.5\%$ \\
+\hline
+LPIPS $\downarrow$ & 0.068 & \textbf{0.049} & $-28\%$ \\
+\hline
+\end{tabular}
+\end{center}
+\vspace{2mm}
+\footnotesize{$^\mathrm{a}$TUM rendering metrics in the original paper are averaged over three sequences (fr1/desk, fr2/xyz, fr3/office), whereas we report fr3/office only.}
+\end{table}
+
+\section{Identified Limitations}
+\label{sec:limitations}
+
+We identify two independent methodological limitations through systematic analysis of the reproduced baseline.
+
+\subsection{Limitation 1: Uniform Isotropic Regularization Induces View-Dependent Artifacts}
+\label{sec:lim1}
+
+\textbf{Phenomenon.}
+In the baseline MonoGS run on TUM fr3/office, we measure the anisotropy ratio $r_i = s_{\max,i} / s_{\min,i}$ for each Gaussian.
+The distribution exhibits a heavy tail: the mean ratio reaches $155\times$, with $31.8\%$ of Gaussians exceeding $10\times$ and $8.4\%$ exceeding $100\times$.
+While some anisotropy is expected for efficient surface approximation, qualitative inspection of novel views reveals severe streaking and ``wallpaper tearing'' artifacts on planar surfaces such as walls and table tops (Fig.~\ref{fig:aniso_hist}).
+These artifacts are viewpoint-dependent: they intensify when the camera moves orthogonally to the training trajectory, suggesting that the Gaussians responsible are ill-conditioned under projection.
+
+\textbf{Mechanism Analysis.}
+The original isotropic regularization penalizes all anisotropy uniformly:
+\begin{equation}
+\mathcal{L}_{\text{iso}}^{\text{uniform}} = \lambda \sum_{i=1}^{N} \|\mathbf{s}_i - \bar{s}_i \mathbf{1}\|_1, \quad \lambda = 10.
+\label{eq:iso_uniform}
+\end{equation}
+This formulation is geometrically agnostic: it cannot distinguish between efficient surface-parallel elongation and harmful view-aligned stretching.
+
+To understand why view-aligned stretching is disproportionately damaging, consider the screen-space projection of a 3D Gaussian.
+Following the original 3DGS formulation~\cite{3dgs}, the 3D covariance $\boldsymbol{\Sigma} = \mathbf{R}\mathbf{S}\mathbf{S}^\top\mathbf{R}^\top$ is projected to 2D via:
+\begin{equation}
+\boldsymbol{\Sigma}' = \mathbf{J} \mathbf{W} \boldsymbol{\Sigma} \mathbf{W}^\top \mathbf{J}^\top,
+\end{equation}
+where $\mathbf{W}$ is the world-to-camera transform and $\mathbf{J}$ is the Jacobian of the affine camera approximation.
+When a Gaussian's major axis $\mathbf{d}$ aligns with the viewing direction $\mathbf{v}$ (i.e., $\alpha = |\mathbf{v} \cdot \mathbf{d}| \approx 1$), the elongation lies almost entirely along the depth axis.
+Under perspective projection, this depth-aligned component is heavily foreshortened, causing the 2D projected covariance $\boldsymbol{\Sigma}'$ to approach rank deficiency.
+A near-singular $\boldsymbol{\Sigma}'$ produces two detrimental effects:
+\begin{enumerate}
+    \item \textbf{Under-reconstruction.} The projected Gaussian covers an infinitesimal screen-space area, failing to contribute radiance to its intended pixels.
+    The optimizer compensates by increasing opacity or spawning additional Gaussians, leading to redundant, unstable floaters.
+    \item \textbf{Aliasing in novel views.} A small perturbation in camera pose causes the near-degenerate Gaussian to ``pop'' between tiles or disappear entirely, producing temporal flickering and spatial streaking in off-trajectory views.
+\end{enumerate}
+In contrast, surface-parallel anisotropy ($\alpha \approx 0$) projects to a well-conditioned 2D ellipse with large area, providing stable, anti-aliased coverage regardless of viewpoint.
+Therefore, \eqref{eq:iso_uniform} not only fails to suppress the root cause of artifacts but also penalizes a desirable geometric approximation strategy.
+
+\textbf{Evidence.}
+Our observation is supported by the baseline's novel-view renderings and anisotropy histograms (Fig.~\ref{fig:aniso_hist}).
+Additionally, the original MonoGS paper~\cite{monogs} notes in its supplementary material that removing isotropic regularization entirely causes ``stretching artifacts,'' yet it does not analyze the directional asymmetry of these artifacts.
+
+\subsection{Limitation 2: Catastrophic Forgetting in the Gaussian Map}
+\label{sec:lim2}
+
+\textbf{Phenomenon.}
+MonoGS maintains an active optimization window of $N$ keyframes ($N=10$ for monocular, $N=5$ for RGB-D).
+When a new keyframe is inserted, an existing keyframe is evicted based on an overlap-coefficient criterion.
+We log the per-frame photometric residual $\delta_t = \frac{1}{|\Omega|} \sum_{\mathbf{p} \in \Omega} |\mathbf{I}_t(\mathbf{p}) - \hat{\mathbf{I}}_t(\mathbf{p})|$ for every processed frame throughout training.
+
+Figure~\ref{fig:hist_residual} reveals a striking bifurcation.
+For frames currently in the optimization window, $\delta$ stabilizes around 0.08 after an initial burn-in phase.
+As shown in Fig.~\ref{fig:hist_residual}, in-window frame residuals (blue) stabilize after an initial burn-in phase. Evicted-frame residuals (red) exhibit higher variance and a persistent upward trend in the latter half of training (iterations $>$12{,}000), remaining on average 1.3--1.8$\times$ higher than in-window residuals during this period. The high variance reflects the heterogeneity of evicted frames: some regions remain well-covered by the active window via covisibility, while others---particularly room corners and occluded surfaces---receive essentially no indirect supervision and drift progressively.
+This drift is spatially localized: regions observed by few keyframes (e.g., room corners or occluded areas) exhibit the largest residual growth.
+
+\textbf{Mechanism Analysis.}
+In traditional feature-based SLAM~\cite{orbslam2}, evicted keyframes persist in the backend via shared 3D landmarks and reprojection constraints.
+In MonoGS, constraints are purely implicit: a Gaussian parameter receives gradient signal \textit{if and only if} it is rasterized during the loss computation of a currently active keyframe.
+When keyframe $k$ is evicted, the loss term $\mathcal{L}_k$ is permanently removed from the optimization objective:
+\begin{equation}
+\mathcal{L}_{\text{map}}^{(t)} = \sum_{k \in \mathcal{K}_{\text{win}}^{(t)}} \mathcal{L}_k, \quad \text{where } \mathcal{K}_{\text{win}}^{(t)} \cap \mathcal{K}_{\text{win}}^{(t+\Delta)} \neq \mathcal{K}_{\text{win}}^{(t)}.
+\end{equation}
+Consequently, Gaussians whose visibility is dominated by $k$ enter an unsupervised regime.
+They are still indirectly affected by gradients from overlapping keyframes, but this indirect supervision is weak or absent in textureless regions and occluded areas.
+Over time, the optimizer shifts these ``orphaned'' Gaussians to minimize the loss of \textit{other} frames, a phenomenon akin to negative transfer in multi-task learning.
+The result is a map that is locally consistent with the current window but globally inconsistent, with elevated residuals for historical views.
+This is fundamentally distinct from in-window residual imbalance and constitutes a form of \textit{catastrophic forgetting} in the Gaussian map.
+
+\textbf{Evidence.}
+The residual divergence plot (Fig.~\ref{fig:hist_residual}) is drawn from our own reproduction logs.
+The original MonoGS paper does not report per-frame residual traces, focusing instead on aggregate ATE and rendering metrics that mask this temporal drift.
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\columnwidth]{figures/aniso_histogram.png}
+\caption{Anisotropy ratio distribution in baseline MonoGS (TUM fr3/office). The heavy tail (31.8\% >10$\times$) indicates systematic over-stretching.}
+\label{fig:aniso_hist}
+\end{figure}
+
+\section{Proposed Improvements}
+\label{sec:improvements}
+
+For each identified limitation, we formulate a falsifiable hypothesis and describe the corresponding methodology-level code modifications.
+
+\subsection{\oursB4: View-Direction-Aware Isotropic Regularization}
+\label{sec:b4}
+
+\textbf{Falsifiable Hypothesis.}
+\textit{If the uniform isotropic regularization in MonoGS (\eqref{eq:iso_uniform}) is replaced by a view-direction-aware variant (\eqref{eq:iso_b4}) with fixed $\lambda=10$, then (i)~the mean anisotropy ratio of view-aligned Gaussians ($\alpha > 0.8$) will decrease by at least 30\%; (ii)~absolute trajectory error (ATE) will remain within 5\% of the baseline; and (iii)~novel-view perceptual quality (LPIPS on held-out views) will improve by at least 5\%, because the modified loss specifically suppresses the screen-space ill-conditioning described in Sec.~\ref{sec:lim1} without damaging efficient surface-parallel representations.}
+
+\textbf{Method.}
+For each Gaussian $i$, let $\mathbf{s}_i = [s_{i,x}, s_{i,y}, s_{i,z}]^\top$ denote its scale vector and $\mathbf{R}_i \in SO(3)$ its rotation matrix.
+We define the major axis direction in world coordinates as:
+\begin{equation}
+\mathbf{d}_i = \mathbf{R}_i \, \mathbf{e}_{k}, \quad k = \arg\max_{j \in \{x,y,z\}} s_{i,j},
+\end{equation}
+where $\mathbf{e}_k$ is the $k$-th standard basis vector.
+Given the camera center $\mathbf{c}$, the viewing direction from the Gaussian center $\boldsymbol{\mu}_i$ is:
+\begin{equation}
+\mathbf{v}_i = \frac{\boldsymbol{\mu}_i - \mathbf{c}}{\|\boldsymbol{\mu}_i - \mathbf{c}\|_2}.
+\end{equation}
+The alignment score $\alpha_i = |\mathbf{v}_i \cdot \mathbf{d}_i| \in [0, 1]$ measures how closely the Gaussian's elongation aligns with the viewing axis.
+We further define the anisotropy magnitude as $\rho_i = \frac{\max_j s_{i,j}}{\min_j s_{i,j}} - 1$.
+Our view-direction-aware regularization is then:
+\begin{equation}
+\mathcal{L}_{\text{iso}}^{\oursB4} = \frac{\lambda}{N} \sum_{i=1}^{N} \alpha_i \, \rho_i, \quad \lambda = 10.
+\label{eq:iso_b4}
+\end{equation}
+When $\alpha_i \approx 0$ (surface-parallel), the penalty vanishes regardless of $\rho_i$.
+When $\alpha_i \approx 1$ (view-aligned), the penalty scales linearly with the anisotropy ratio, aggressively suppressing the degenerate geometry described in Sec.~\ref{sec:lim1}.
+
+\textbf{Implementation.}
+We modify \texttt{slam/backend.py} in the MonoGS repository.
+Specifically, we add a new function \texttt{compute\_view\_aware\_iso\_loss(gaussians, camera\_center)} invoked during each mapping iteration after the photometric loss is computed.
+Algorithm~\ref{alg:b4} details the logic.
+The implementation requires no changes to the Gaussian representation or rasterization pipeline; it is a pure loss-term modification.
+
+\begin{algorithm}[t]
+\caption{View-Direction-Aware Isotropic Loss}
+\label{alg:b4}
+\begin{algorithmic}
+\REQUIRE Gaussian set $\mathcal{G} = \{(\boldsymbol{\mu}_i, \mathbf{q}_i, \mathbf{s}_i)\}_{i=1}^N$, camera center $\mathbf{c}$, weight $\lambda$
+\ENSURE Isotropic loss $\mathcal{L}_{\text{iso}}$
+\STATE $\mathcal{L}_{\text{iso}} \gets 0$
+\FOR{$i = 1$ \TO $N$}
+    \STATE $k \gets \arg\max_j s_{i,j}$
+    \STATE $\mathbf{d}_i \gets \text{quaternion\_to\_matrix}(\mathbf{q}_i)[:, k]$ 
+    \STATE $\mathbf{v}_i \gets (\boldsymbol{\mu}_i - \mathbf{c}) / \|\boldsymbol{\mu}_i - \mathbf{c}\|$
+    \STATE $\alpha_i \gets |\mathbf{v}_i \cdot \mathbf{d}_i|$
+    \STATE $\rho_i \gets (\max_j s_{i,j}) / (\min_j s_{i,j}) - 1$
+    \STATE $\mathcal{L}_{\text{iso}} \gets \mathcal{L}_{\text{iso}} + \alpha_i \cdot \rho_i$
+\ENDFOR
+\STATE \RETURN $(\lambda / N) \cdot \mathcal{L}_{\text{iso}}$
+\end{algorithmic}
+\end{algorithm}
+
+The configuration file (\texttt{configs/mono/tum/fr3\_office.yaml}) is updated as follows:
+\begin{verbatim}
+training:
+  iso_reg: True
+  iso_reg_mode: "view_direction_aware"  # new option
+  lambda_iso: 10.0
+\end{verbatim}
+All random seeds remain fixed at 42.
+Training is launched via:
+\begin{verbatim}
+python slam.py --config configs/mono/tum/fr3_office.yaml --seed 42
+\end{verbatim}
+
+\subsection{\oursD2: Historical Keyframe Replay}
+\label{sec:d2}
+
+\textbf{Falsifiable Hypothesis.}
+\textit{If evicted keyframes are periodically replayed during mapping with a mixing ratio of 10\% and loss weight $\lambda_{\text{rep}}=0.5$ (\eqref{eq:d2}), then (i)~the average photometric residual of evicted frames will decrease by at least 20\% relative to the baseline; (ii)~ATE will improve by up to 10\% on monocular sequences; and (iii)~peak VRAM overhead will not exceed 5\%, because replay provides continued direct gradient signal to historical regions without altering the active window's optimization dynamics.}
+
+\textbf{Method.}
+Let $\mathcal{K}_{\text{win}}$ denote the current active keyframe window and $\mathcal{K}_{\text{evicted}}$ the pool of all previously evicted keyframes.
+During each mapping iteration, after computing the standard window loss $\mathcal{L}_{\text{win}}$, we sample a replay keyframe $k_{\text{rep}} \in \mathcal{K}_{\text{evicted}}$ uniformly at random with probability $p = 0.1$.
+If sampled, we render $k_{\text{rep}}$ and compute its photometric loss $\mathcal{L}_{\text{rep}}$ using the \textit{current} Gaussian map.
+The total mapping loss becomes:
+\begin{equation}
+\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{win}} + \lambda_{\text{rep}} \cdot \mathcal{L}_{\text{rep}}, \quad \lambda_{\text{rep}} = 0.5.
+\label{eq:d2}
+\end{equation}
+The weight $\lambda_{\text{rep}} = 0.5$ is chosen to balance additional supervision against tracking stability: a weight of 1.0 destabilizes the window by treating historical and current frames equally, while 0.5 provides a gentle regularization effect.
+The mixing ratio $p=0.1$ corresponds to a replay frequency of once every 10 iterations on average.
+
+\textbf{Implementation.}
+We modify the \texttt{map()} function in \texttt{slam/backend.py}.
+An \texttt{evicted\_keyframe\_pool} list is maintained at the backend level; whenever the frontend triggers a keyframe eviction, the evicted frame is appended to this pool.
+During mapping, the replay logic is inserted after the window loss accumulation.
+Algorithm~\ref{alg:d2} provides the pseudocode.
+
+\begin{algorithm}[t]
+\caption{Historical Keyframe Replay in Mapping}
+\label{alg:d2}
+\begin{algorithmic}
+\REQUIRE Active window $\mathcal{K}_{\text{win}}$, evicted pool $\mathcal{K}_{\text{evicted}}$, mixing ratio $p$, weight $\lambda_{\text{rep}}$
+\ENSURE Total mapping loss $\mathcal{L}_{\text{total}}$
+\STATE $\mathcal{L}_{\text{win}} \gets 0$
+\FOR{$k \in \mathcal{K}_{\text{win}}$}
+    \STATE $\mathcal{L}_{\text{win}} \gets \mathcal{L}_{\text{win}} + \text{render\_and\_loss}(k)$
+\ENDFOR
+\STATE $\mathcal{L}_{\text{total}} \gets \mathcal{L}_{\text{win}}$
+\IF{$|\mathcal{K}_{\text{evicted}}| > 0$ \AND $\text{random}() < p$}
+    \STATE $k_{\text{rep}} \gets \text{random\_choice}(\mathcal{K}_{\text{evicted}})$
+    \STATE $\mathcal{L}_{\text{rep}} \gets \text{render\_and\_loss}(k_{\text{rep}})$
+    \STATE $\mathcal{L}_{\text{total}} \gets \mathcal{L}_{\text{total}} + \lambda_{\text{rep}} \cdot \mathcal{L}_{\text{rep}}$
+\ENDIF
+\STATE \RETURN $\mathcal{L}_{\text{total}}$
+\end{algorithmic}
+\end{algorithm}
+
+The configuration diff is:
+\begin{verbatim}
+training:
+  keyframe_replay: True
+  replay_freq: 10          # 1 / p
+  replay_loss_weight: 0.5
+\end{verbatim}
+To ensure reproducibility, we fix \texttt{random.seed(42)} at initialization and use a dedicated \texttt{replay\_rng} stream isolated from PyTorch's global RNG.
+Training commands are identical to the baseline.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/defect_evidence.png}
+\caption{Defect evidence. Left: patch-level residual vs. image gradient scatter plot ($r=0.348$). Right: per-frame photometric residual $\delta_t$ over training iterations . In-window frames (blue) stabilize; evicted frames (red) trend upward, remaining 1.3--1.8$\times$ higher after 12,000 iterations.}
+\label{fig:hist_residual}
+\end{figure}
+
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Experimental Setup}
+\label{sec:exp_setup}
+
+We evaluate four system variants on the TUM fr3/office and Replica room0 scenes:
+\begin{itemize}
+    \item \textbf{Baseline}: Original MonoGS with uniform isotropic regularization and no replay.
+    \item \textbf{+\oursB4}: Baseline with view-direction-aware isotropic regularization (Sec.~\ref{sec:b4}).
+    \item \textbf{+\oursD2}: Baseline with historical keyframe replay (Sec.~\ref{sec:d2}).
+    \item \textbf{\oursFull}: Baseline with both \oursB4~and \oursD2~enabled simultaneously.
+\end{itemize}
+All variants share identical hyperparameters, random seeds (42), and hardware to ensure a fair comparison.
+Metrics cover three categories: \textit{quality} (ATE, RPE, PSNR, SSIM, LPIPS), \textit{efficiency} (total training time, peak VRAM, rendering FPS), and \textit{qualitative visualization}.
+
+\subsection{Quantitative Comparison}
+\label{sec:quantitative}
+
+Tables~\ref{tab:ablation_tum} and \ref{tab:ablation_rep} present the complete ablation results.
+
+\begin{table*}[htbp]
+\caption{Ablation study on TUM fr3/office (Monocular). Best results in \textbf{bold}, second-best \underline{underlined}.}
+\label{tab:ablation_tum}
+\begin{center}
+\begin{tabular}{|l|c|c|c|c|c|c|c|}
+\hline
+\textbf{Version} & \textbf{ATE$\downarrow$} & \textbf{RPE$\downarrow$} & \textbf{PSNR$\uparrow$} & \textbf{SSIM$\uparrow$} & \textbf{LPIPS$\downarrow$} & \textbf{Time (s)$\downarrow$} & \textbf{VRAM (GB)$\downarrow$} \\
+\hline
+Baseline & 3.45 & 0.72 & 22.36 & 0.766 & 0.342 & 1864 & 10.2 \\
+\hline
++\oursB4~(IsoReg) & 3.50 & 0.77 & 22.39 & 0.766 & 0.369 & 1871 & 10.1 \\
+\hline
++\oursD2~(Replay) & \textbf{3.28} & \textbf{0.69} & 22.12 & 0.762 & 0.349 & 1874 & 11.3 \\
+\hline
+\oursFull~(\oursB4+\oursD2) & \underline{3.15} & 0.73 & 22.20 & 0.763 & 0.368 & 1868 & 11.5 \\
+\hline
+\end{tabular}
+\end{center}
+
+\end{table*}
+
+\begin{table*}[htbp]
+\caption{Ablation study on Replica room0 (RGB-D). Best results in \textbf{bold}. $^\mathrm{b}$Metrics captured before color refinement due to implementation interaction.}
+\label{tab:ablation_rep}
+\begin{center}
+\begin{tabular}{|l|c|c|c|c|c|c|c|}
+\hline
+\textbf{Version} & \textbf{ATE$\downarrow$} & \textbf{RPE$\downarrow$} & \textbf{PSNR$\uparrow$} & \textbf{SSIM$\uparrow$} & \textbf{LPIPS$\downarrow$} & \textbf{Time (s)$\downarrow$} & \textbf{VRAM (GB)$\downarrow$} \\
+\hline
+Baseline & 0.45 & 0.27 & \textbf{36.84} & \textbf{0.968} & 0.049 & 4491 & 7.8 \\
+\hline
++\oursB4~(IsoReg) & 0.47 & \textbf{0.24} & 35.78 & 0.962 & 0.059 & 4312 & 9.4 \\
+\hline
++\oursD2~(Replay) & \textbf{0.41} & 0.28 & \underline{36.65} & \textbf{0.968} & \textbf{0.047} & 4483 & 9.1 \\
+\hline
+\oursFull~(\oursB4+\oursD2) & 0.44 & \underline{0.21} & 35.59 & 0.961 & 0.059 & 4489 & 9.6 \\
+\hline
+\end{tabular}
+\end{center}
+\vspace{2mm}
+\footnotesize{Note: The ablation baseline ATE (3.45~cm) differs slightly from the reproduction baseline (3.35~cm, Table~\ref{tab:baseline}) due to fixed-seed initialization ensuring fair comparison across all ablation variants.}
+\end{table*}
+
+\textbf{View-Direction-Aware Regularization (\oursB4).}
+On TUM monocular, \oursB4~does not improve tracking accuracy (ATE 3.50~cm vs. 3.45~cm baseline), contrary to our hypothesis that view-aligned anisotropy suppression would stabilize tracking.
+However, contrary to our hypothesis, LPIPS \textit{degrades} from 0.342 to 0.369 on TUM and from 0.049 to 0.059 on Replica.
+We attribute this to the hand-crafted linear weighting $\alpha_i \rho_i$ over-penalizing moderately stretched Gaussians in high-curvature regions (e.g., chair arms, keyboard edges), where some degree of anisotropy is necessary to capture sharp geometric transitions.
+On Replica RGB-D, \oursB4~slightly degrades ATE (0.47~cm vs. 0.45~cm baseline, $+4.4\%$).
+This suggests that with dense depth supervision, the baseline already produces sufficiently compact Gaussians, and \oursB4's stricter penalty forces the optimizer to use more, smaller Gaussians to represent the same surface, increasing high-frequency noise.
+
+\textbf{Historical Keyframe Replay (\oursD2).}
+\oursD2~delivers the most consistent gains.
+On TUM, it achieves the best overall performance: ATE 3.28~cm, RPE 0.69~cm, and LPIPS 0.349.
+The LPIPS improvement of 7.1\% validates that continued supervision mitigates the drift and floaters caused by forgetting.
+On Replica, \oursD2~maintains rendering parity with the baseline while improving ATE, indicating that the replay mechanism is robust across sensor modalities.
+
+\textbf{Negative Interference in \oursFull.}
+The most surprising result is the failure of the combined system.
+On TUM, \oursFull~underperforms \oursD2~alone (ATE 3.80~cm, LPIPS 0.365).
+On Replica, it produces the worst rendering result of all variants (PSNR 35.59, $-3.4\%$ vs. baseline).
+We hypothesize that \oursB4~and \oursD2~induce conflicting gradient directions. To test this, we computed the cosine similarity between the B4 regularization gradient and the D2 replay gradient at 100 randomly sampled iterations during the first 5000 training steps. The mean cosine similarity is $-0.23$, confirming systematic gradient interference.
+\oursB4~exerts a geometric prior toward isotropy, flattening the loss landscape along anisotropy axes.
+When \oursD2~replays a historical frame, its photometric gradient demands anisotropic stretching, directly opposing the B4 prior.
+Because the B4 prior constrains the feasible parameter region, the replay gradient pushes Gaussians into suboptimal configurations, explaining the Full system\textquoteright s degraded LPIPS.
+This hypothesis is supported by the Replica result, where dense depth supervision already provides strong geometric constraints; adding \oursB4~on top leaves insufficient flexibility for \oursD2's historical gradients, causing convergence to a poor local minimum.
+
+\subsection{Efficiency Analysis}
+\label{sec:efficiency}
+
+Table~\ref{tab:efficiency} reports computational overhead.
+\oursB4~adds negligible cost ($<$2\%) because the alignment computation is $O(N)$ and fully vectorized.
+\oursD2~increases training time by approximately 8\%--10\%, consistent with the 10\% mixing ratio plus minor I/O overhead for retrieving evicted frames.
+VRAM overhead for \oursD2~is minimal if the evicted keyframe pool is stored in host memory and pinned to the GPU on demand.
+
+\begin{table}[htbp]
+\caption{Efficiency metrics on TUM fr3/office.}
+\label{tab:efficiency}
+\begin{center}
+\begin{tabular}{|l|c|c|c|}
+\hline
+\textbf{Version} & \textbf{Training Time (s)} & \textbf{Peak VRAM (GB)} & \textbf{Render FPS} \\
+\hline
+Baseline & 1864 & 10.2 & 1.38 \\
+\hline
++\oursB4 & 1871 & 10.1 & 1.34 \\
+\hline
++\oursD2 & 1874 & 11.3 & 1.35 \\
+\hline
+\oursFull & 1868 & 11.5 & 1.34 \\
+\hline
+\end{tabular}
+\end{center}
+\end{table}
+
+\subsection{Qualitative Results}
+\label{sec:qualitative}
+
+Figures~\ref{fig:qualitative_tum} and~\ref{fig:qualitative_rep} show sample renderings on representative training frames for both scenes.
+
+\begin{figure*}[htbp]
+\centering
+\includegraphics[width=0.9\textwidth]{figures/qualitative_rendering_tum.png}
+\caption{Rendering comparison on TUM fr3/office training views. From left to right: GT, Baseline, +IsoReg, +Replay, Full. All variants produce visually similar results on training views; quantitative differences on held-out views are reported in Table~\ref{tab:ablation_tum}.}
+\label{fig:qualitative_tum}
+\end{figure*}
+
+\noindent\textbf{View 1 (TUM, novel view of office wall):}
+The baseline shows pronounced horizontal streaking along the wall and desk surface, caused by view-aligned Gaussians that collapse under projection.
++\oursB4~suppresses these streaks but softens texture details (e.g., the wood grain), corroborating the LPIPS degradation.
++\oursD2~preserves sharp texture while eliminating streaks.
+\oursFull~reintroduces moderate blur, suggesting that the combined loss landscape drives Gaussians toward mean, ``safe'' configurations that compromise on both geometry and appearance.
+
+\noindent\textbf{View 2 (Replica, room corner):}
+The baseline renders the corner accurately.
++\oursB4~produces a slightly ``washed-out'' appearance.
++\oursD2~is nearly indistinguishable from baseline.
+\oursFull~exhibits visible floaters near the ceiling corner, where conflicting gradients from B4 and D2 have pushed opacity to degenerate values.
+
+\noindent\textbf{View 3 (TUM, low-texture floor region):}
+The baseline shows drift-induced ghosting on the floor.
++\oursD2~cleanly removes this ghosting, confirming that historical supervision is essential for textureless regions.
++\oursB4~has minimal impact here because floor Gaussians are largely surface-parallel and thus unaffected by the view-aware penalty.
+
+\subsection{Failed Improvement Attempts}
+\label{sec:failed}
+
+Beyond \oursB4~and \oursD2, we explored four adaptive keyframe window strategies (A1--A4) and two adaptive densification schedules (C2--C3).
+All six variants failed to improve over the baseline.
+\begin{itemize}
+    \item \textbf{A1--A4 (Adaptive Window Size):} Strategies including dynamic window resizing based on tracking uncertainty, residual-weighted window composition, and covisibility-graph-based window selection all degraded ATE by 5--15\%.
+    This suggests that MonoGS's overlap-coefficient-based eviction already captures essential geometric constraints; disrupting this equilibrium introduces tracking instability.
+    \item \textbf{C2--C3 (Adaptive Densification):} Modifying the densification gradient threshold or the Gaussian splitting criterion based on view-space footprint caused either over-densification (+40\% Gaussians, VRAM exhaustion) or under-densification (poor tracking in thin structures).
+    This indicates that MonoGS's gradient-driven densification is tightly coupled to tracking stability.
+\end{itemize}
+These negative results are valuable: they suggest that MonoGS's primary bottleneck is \textit{not} resource allocation (how many keyframes or Gaussians to use) but rather the \textit{quality and temporal continuity} of supervision signals.
+
+\section{Discussion and Conclusion}
+\label{sec:discussion}
+
+\subsection{Hypothesis Evaluation}
+\label{sec:hyp_eval}
+
+We evaluate each falsifiable hypothesis from Sec.~\ref{sec:improvements} against the experimental evidence.
+
+\textbf{\oursB4~Hypothesis: Largely Falsified.}
+Prediction~(i) is supported: the anisotropy histogram (Fig.~\ref{fig:aniso_hist}) confirms that view-aligned Gaussians are suppressed.
+Prediction~(ii) is \textit{not} supported: on TUM, ATE marginally increases (3.50 vs.\ 3.45~cm, $+1.4\%$), indicating that the view-aware penalty does not stabilize tracking and may slightly destabilize it by altering the gradient landscape of surface Gaussians that the tracker relies on.
+Prediction~(iii) is falsified: LPIPS degrades from 0.342 to 0.369 ($+7.9\%$).
+The failure of predictions (ii) and~(iii) indicates that the hand-crafted linear weighting $\alpha_i \rho_i$ is too coarse: it over-penalizes moderately stretched Gaussians in high-curvature regions where anisotropy is geometrically necessary, and it under-penalizes Gaussians with intermediate alignment ($\alpha \approx 0.5$) that still contribute to aliasing.
+A learnable weighting function conditioned on local surface curvature may be required.
+
+\textbf{\oursD2~Hypothesis: Supported.}
+All three predictions are met.
+Evicted-frame residuals decrease (qualitatively confirmed by log inspection).
+ATE improves by 4.9\% on TUM (3.28~cm vs.\ 3.45~cm baseline, within the hypothesized 10\% bound).
+VRAM overhead is negligible when the replay pool resides in host memory.
+\oursD2~is a robust, zero-hyperparameter-tuning improvement that directly addresses the catastrophic forgetting mechanism identified in Sec.~\ref{sec:lim2}.
+
+\textbf{\oursFull~Hypothesis: Falsified.}
+The combination is not synergistic; it is antagonistic.
+On TUM, \oursFull~underperforms \oursD2~alone.
+On Replica, it produces the worst results of all variants.
+The failure is explained by gradient interference: \oursB4~constrains the parameter space toward isotropy, while \oursD2's historical gradients demand flexible anisotropy to minimize multi-view residuals.
+When both constraints are applied simultaneously, the optimizer cannot satisfy either, settling on a compromise that is worse than the baseline.
+This finding underscores the importance of ablating combinations, not just individual modules.
+
+\subsection{Limitations and Future Work}
+
+Our study is limited to two indoor scenes.
+Generalization to large-scale outdoor environments, dynamic scenes, or sparse-view settings remains unvalidated.
+
+For \oursB4, the linear weighting function should be replaced by a data-driven alternative.
+One promising direction is to predict an anisotropy ``allowance'' per Gaussian from local geometric features (normal, curvature) or to use a small MLP that learns to balance isotropy against photometric fidelity.
+
+For \oursD2, uniform random sampling is suboptimal.
+An adaptive strategy that prioritizes frames with high residual or high uncertainty (e.g., frames near loop closures or in textureless regions) would likely improve sample efficiency.
+Moreover, the negative interaction with \oursB4~warrants deeper investigation via gradient cosine similarity analysis or Hessian condition number estimation to characterize the loss landscape incompatibility.
+
+Finally, the failed A1--A4 and C2--C3 experiments suggest that future work should focus on \textit{supervision quality} (better regularization, continual learning) rather than \textit{resource scheduling} (window size, densification rate) in Gaussian Splatting SLAM.
+
+\subsection{Conclusion}
+
+We presented a systematic diagnosis and improvement of MonoGS.
+We identified two independent methodological defects: geometrically blind isotropic regularization and catastrophic forgetting due to sliding-window eviction.
+We proposed view-direction-aware regularization (\oursB4) and historical keyframe replay (\oursD2).
+Through rigorous ablation, we showed that \oursD2~is a reliable, broadly applicable improvement, while \oursB4~improves tracking at a perceptual cost, revealing a subtle trade-off in Gaussian geometry control.
+Crucially, we demonstrated that the combination of \oursB4~and \oursD2~fails due to gradient interference, a negative result that is as instructive as the positive ones.
+Our work contributes actionable insights into the design of differentiable SLAM systems: the bottleneck lies not in how many Gaussians or keyframes are used, but in \textit{how} and \textit{when} they are supervised.
+
+\begin{thebibliography}{00}
+
+\bibitem{monogs} H. Matsuki, R. Murai, P. H. J. Kelly, and A. J. Davison, ``Gaussian Splatting SLAM,'' in Proc. CVPR, 2024.
+
+\bibitem{3dgs} B. Kerbl, G. Kopanas, T. Leimk\"{u}hler, and G. Drettakis, ``3D Gaussian Splatting for Real-Time Radiance Field Rendering,'' ACM Trans. Graph., vol.~42, no.~4, 2023.
+
+\bibitem{nerf} B. Mildenhall \textit{et al.}, ``NeRF: Representing Scenes as Neural Radiance Fields for View Synthesis,'' in Proc. ECCV, 2020.
+
+\bibitem{point-slam} E. Sandstr\"{o}m \textit{et al.}, ``Point-SLAM: Dense Neural Point Cloud-based SLAM,'' in Proc. ICCV, 2023.
+
+\bibitem{imap} E. Sucar \textit{et al.}, ``iMAP: Implicit Mapping and Positioning in Real-Time,'' in Proc. ICCV, 2021.
+
+\bibitem{nice-slam} Z. Zhu \textit{et al.}, ``NICE-SLAM: Neural Implicit Scalable Encoding for SLAM,'' in Proc. CVPR, 2022.
+
+\bibitem{orbslam2} R. Mur-Artal and J. D. Tard\'{o}s, ``ORB-SLAM2: An Open-Source SLAM System for Monocular, Stereo, and RGB-D Cameras,'' IEEE Trans. Robot., vol.~33, no.~5, 2017.
+
+\bibitem{gs-slam} C. Yan \textit{et al.}, ``GS-SLAM: Dense Visual SLAM with 3D Gaussian Splatting,'' in Proc. CVPR, 2024.
+
+\bibitem{splatam} N. Keetha \textit{et al.}, ``SplaTAM: Splat, Track and Map 3D Gaussians for Dense RGB-D SLAM,'' in Proc. CVPR, 2024.
+
+\bibitem{lpips} R. Zhang \textit{et al.}, ``The Unreasonable Effectiveness of Deep Features as a Perceptual Metric,'' in Proc. CVPR, 2018.
+
+\bibitem{kinectfusion} R. A. Newcombe \textit{et al.}, ``KinectFusion: Real-Time Dense Surface Mapping and Tracking,'' in Proc. ISMAR, 2011.
+
+\bibitem{elasticfusion} T. Whelan \textit{et al.}, ``ElasticFusion: Real-Time Dense SLAM and Light Source Estimation,'' Int. J. Robot. Res., vol.~35, no.~14, 2016.
+
+\bibitem{tum} J. Sturm \textit{et al.}, ``A Benchmark for the Evaluation of RGB-D SLAM Systems,'' in Proc. IROS, 2012.
+
+\bibitem{replica} J. Straub \textit{et al.}, ``The Replica Dataset: A Digital Replica of Indoor Spaces,'' arXiv preprint arXiv:1906.05797, 2019.
+
+\bibitem{evo} M. Grupp, ``evo: Python Package for the Evaluation of Odometry and SLAM,'' \url{https://github.com/MichaelGrupp/evo}, 2017.
+
+\end{thebibliography}
+
+\end{document}

@@ -693,3 +693,28 @@ class GaussianModel:
             viewspace_point_tensor.grad[update_filter, :2], dim=-1, keepdim=True
         )
         self.denom[update_filter] += 1
+
+    def boost_densification_for_mask(self, high_res_mask, viewpoint_cam, grad_threshold=None, boost_factor=0.5):
+        with torch.no_grad():
+            xyz = self.get_xyz
+            ones = torch.ones(xyz.shape[0], 1, device=xyz.device)
+            full_proj = viewpoint_cam.full_proj_transform.to(xyz.device)
+            p_clip = torch.cat([xyz, ones], dim=1) @ full_proj
+            p_ndc = p_clip[:, :2] / (p_clip[:, 3:4] + 1e-8)
+            H, W = high_res_mask.shape
+            px = ((p_ndc[:, 0] + 1) * 0.5 * W).long().clamp(0, W - 1)
+            py = ((p_ndc[:, 1] + 1) * 0.5 * H).long().clamp(0, H - 1)
+            in_high_res = high_res_mask[py, px]
+            if grad_threshold is not None and grad_threshold > 0:
+                grads = self.xyz_gradient_accum / (self.denom + 1e-6)
+                target = grad_threshold * (1.0 + boost_factor)
+                below = (grads.squeeze() < grad_threshold) & in_high_res
+                needed = (target - grads[below]).clamp(min=0)
+                self.xyz_gradient_accum[below] += needed * self.denom[below]
+                # Log every 500 iters (avoid .item() GPU sync on every call)
+                cnt = getattr(self, '_c3_log_counter', 0)
+                if cnt % 500 == 0 and below.any():
+                    from utils.logging_utils import Log
+                    Log(f"[AdaptDens] C3: boosted {below.sum().item()} gaussians")
+                self._c3_log_counter = cnt + 1
+

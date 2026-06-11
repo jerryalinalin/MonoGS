@@ -1,0 +1,7 @@
+mean_anisotropy_ratio=12.5270
+pct_ratio_gt_10=8.40
+pct_ratio_gt_50=2.26
+total_gaussians=38385
+min_ratio=0.9873
+max_ratio=114551.7500
+median_ratio=1.0122

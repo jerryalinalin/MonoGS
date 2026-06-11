@@ -1,0 +1,31 @@
+inherit_from: "configs/mono/tum/base_config.yaml"
+
+Dataset:
+  dataset_path: "datasets/tum/rgbd_dataset_freiburg3_long_office_household"
+  Calibration:
+    fx: 535.4
+    fy: 539.2
+    cx: 320.1
+    cy: 247.6
+    k1: 0.0
+    k2: 0.0
+    p1: 0.0
+    p2: 0.0
+    k3: 0.0
+    width: 640
+    height: 480
+    depth_scale: 5000.0
+    distorted: False
+seed: 42
+Training:
+  adaptive_densify: False       # 改进C: True = 启用自适应密度化
+  densify_residual_thresh: 1.5   # 改进C: 残差超过均值几倍触发补充密度化
+  adaptive_kf: False      # Phase 3 A2: 加权评分踢帧（已备份）
+  keyframe_replay: True
+  replay_freq: 10
+  kf_alpha: 0.7           # A2: OC 权重
+  iso_reg: False           # Phase 4 B1: 阈值截断各向同性正则化
+  iso_reg_mode: "b1"
+  iso_reg_lambda: 0.01    # 正则化强度
+  iso_reg_threshold: 5.0  # B1: 超过此倍数的拉伸才惩罚
+  

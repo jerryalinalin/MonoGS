@@ -1,0 +1,13 @@
+inherit_from: "configs/rgbd/replica/base_config.yaml"
+Dataset:
+  dataset_path: "datasets/replica/room0/"
+  single_thread: False
+seed: 42
+Training:
+  adaptive_kf: False      # Phase 3 A1: OC + 残差双条件
+  kf_residual_threshold: 0.05  # A1: 残差低于此值才允许踢
+  iso_reg: False
+  keyframe_replay: True
+  replay_freq: 10
+  iso_reg_lambda: 0.01    # 正则化强度
+  iso_reg_threshold: 5.0  # B3: 超过此倍数的拉伸才惩罚

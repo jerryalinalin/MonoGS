@@ -43,6 +43,9 @@ class FrontEnd(mp.Process):
         self.device = "cuda:0"
         self.pause = False
 
+        # Phase 3B: 帧残差历史缓存（用于残差变化率计算）
+        self.frame_loss_history = {}
+
     def set_hyperparams(self):
         self.save_dir = self.config["Results"]["save_dir"]
         self.save_results = self.config["Results"]["save_results"]
@@ -53,6 +56,29 @@ class FrontEnd(mp.Process):
         self.kf_interval = self.config["Training"]["kf_interval"]
         self.window_size = self.config["Training"]["window_size"]
         self.single_thread = self.config["Training"]["single_thread"]
+
+    # === Phase 3B: 自适应关键帧（改进A - 残差变化率）===
+    def compute_frame_render_loss(self, kf_idx):
+        """计算指定关键帧的当前渲染残差，并返回残差变化率。
+        变化率越低说明该帧已停止提供新梯度信息，可以移出窗口。"""
+        cam = self.cameras[kf_idx]
+        with torch.no_grad():
+            render_pkg = render(
+                cam, self.gaussians,
+                self.pipeline_params, self.background
+            )
+            rendered = render_pkg["render"]
+            gt = cam.original_image.cuda()
+            current_loss = torch.abs(rendered - gt).mean().item()
+
+        # 计算残差变化率：|L1_current - L1_prev| / L1_prev
+        prev_loss = self.frame_loss_history.get(kf_idx, current_loss)
+        change_rate = abs(current_loss - prev_loss) / (prev_loss + 1e-8)
+
+        # 更新历史
+        self.frame_loss_history[kf_idx] = current_loss
+
+        return current_loss, change_rate
 
     def add_new_keyframe(self, cur_frame_idx, depth=None, opacity=None, init=False):
         rgb_boundary_threshold = self.config["Training"]["rgb_boundary_threshold"]
@@ -260,28 +286,60 @@ class FrontEnd(mp.Process):
         kf_0_WC = torch.linalg.inv(getWorld2View2(curr_frame.R, curr_frame.T))
 
         if len(window) > self.config["Training"]["window_size"]:
-            # we need to find the keyframe to remove...
-            inv_dist = []
-            for i in range(N_dont_touch, len(window)):
-                inv_dists = []
-                kf_i_idx = window[i]
-                kf_i = self.cameras[kf_i_idx]
-                kf_i_CW = getWorld2View2(kf_i.R, kf_i.T)
-                for j in range(N_dont_touch, len(window)):
-                    if i == j:
-                        continue
-                    kf_j_idx = window[j]
-                    kf_j = self.cameras[kf_j_idx]
-                    kf_j_WC = torch.linalg.inv(getWorld2View2(kf_j.R, kf_j.T))
-                    T_CiCj = kf_i_CW @ kf_j_WC
-                    inv_dists.append(1.0 / (torch.norm(T_CiCj[0:3, 3]) + 1e-6).item())
-                T_CiC0 = kf_i_CW @ kf_0_WC
-                k = torch.sqrt(torch.norm(T_CiC0[0:3, 3])).item()
-                inv_dist.append(k * sum(inv_dists))
+            # === Phase 3 A2: 加权评分踢帧 ===
+            if self.config["Training"].get("adaptive_kf", False):
+                alpha = self.config["Training"].get("kf_alpha", 0.7)
+                # 计算各候选帧的 OC 和残差
+                candidates = []
+                for i in range(N_dont_touch, len(window)):
+                    kf_idx = window[i]
+                    intersection = torch.logical_and(
+                        cur_frame_visibility_filter, occ_aware_visibility[kf_idx]
+                    ).count_nonzero()
+                    denom = min(
+                        cur_frame_visibility_filter.count_nonzero(),
+                        occ_aware_visibility[kf_idx].count_nonzero(),
+                    )
+                    oc_val = (intersection / denom).item() if denom.item() > 0 else 0.0
+                    loss, _ = self.compute_frame_render_loss(kf_idx)
+                    candidates.append((oc_val, loss, kf_idx))
+                # 归一化残差
+                max_loss = max(c[1] for c in candidates) if candidates else 1.0
+                # 加权评分：得分最高的踢走
+                scored = []
+                for oc_val, loss, kf_idx in candidates:
+                    norm_loss = loss / max_loss if max_loss > 0 else 0.0
+                    score = alpha * (1.0 - oc_val) + (1.0 - alpha) * (1.0 - norm_loss)
+                    scored.append((score, oc_val, loss, kf_idx))
+                scored.sort(key=lambda x: -x[0])
+                best_score, best_oc, best_loss, best_idx = scored[0]
+                Log(f"[AdaptiveKF] A2 α={alpha:.2f} evict f{best_idx} "
+                    f"score={best_score:.3f} OC={best_oc:.3f} loss={best_loss:.4f}")
+                removed_frame = best_idx
+                window.remove(removed_frame)
+            else:
+                # 原始逻辑：踢与最新帧最不相似的帧
+                inv_dist = []
+                for i in range(N_dont_touch, len(window)):
+                    inv_dists = []
+                    kf_i_idx = window[i]
+                    kf_i = self.cameras[kf_i_idx]
+                    kf_i_CW = getWorld2View2(kf_i.R, kf_i.T)
+                    for j in range(N_dont_touch, len(window)):
+                        if i == j:
+                            continue
+                        kf_j_idx = window[j]
+                        kf_j = self.cameras[kf_j_idx]
+                        kf_j_WC = torch.linalg.inv(getWorld2View2(kf_j.R, kf_j.T))
+                        T_CiCj = kf_i_CW @ kf_j_WC
+                        inv_dists.append(1.0 / (torch.norm(T_CiCj[0:3, 3]) + 1e-6).item())
+                    T_CiC0 = kf_i_CW @ kf_0_WC
+                    k = torch.sqrt(torch.norm(T_CiC0[0:3, 3])).item()
+                    inv_dist.append(k * sum(inv_dists))
 
-            idx = np.argmax(inv_dist)
-            removed_frame = window[N_dont_touch + idx]
-            window.remove(removed_frame)
+                idx = np.argmax(inv_dist)
+                removed_frame = window[N_dont_touch + idx]
+                window.remove(removed_frame)
 
         return window, removed_frame
 

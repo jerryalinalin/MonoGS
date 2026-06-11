@@ -1,3 +1,4 @@
+.claude
 *.pyc
 .vscode
 output
@@ -13,4 +14,10 @@ cameras.json
 datasets
 wandb
 
-result*
+results/tum_freiburg3/exploratory/
+results/replica_room0/exploratory/
+run_overnight.sh
+run_watchdog.sh
+docs/paper/*
+!docs/paper/report.tex
+!docs/paper/report.pdf
