@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> 本仓库基于 MonoGS 开展复现与方法改进。我的改进代码、消融实验、实验记录和复现说明位于 [`improvement`](../../tree/improvement) 分支；详细内容见 [`README_IMPROVEMENT.md`](https://github.com/jerryalinalin/MonoGS/blob/improvement/README_IMPROVEMENT.md)。下方内容为原始 MonoGS 项目说明
+
 [comment]: <> (# Gaussian Splatting SLAM)
 
 <!-- PROJECT LOGO -->
